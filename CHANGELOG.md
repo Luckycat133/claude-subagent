@@ -2,6 +2,13 @@
 
 All notable changes to `claude-subagent` are documented in this file.
 
+## [0.1.1] - 2026-11-23
+
+### Changed
+- Simplified persistent configuration to a unified `defaultRoute` with free-form `policies.usagePolicy` and optional `scenarioOverrides` (removed rigid separate routing modes).
+- Added repository-local `.agents/skills/claude-subagent` and `.claude/skills/claude-subagent` symlinks for automatic skill discovery inside checkouts.
+- Polished `claude-subagent` skill guidance on proactive team spin-up, outcome-oriented briefing, and structured exception recovery.
+
 ## [0.1.0] - 2026-11-23
 
 ### Added

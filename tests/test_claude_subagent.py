@@ -44,8 +44,8 @@ class TestClaudeSubagent(unittest.TestCase):
         os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
         return path
 
-    def test_version_starts_at_0_1_0(self):
-        self.assertEqual(__version__, "0.1.0")
+    def test_version_matches_semver(self):
+        self.assertEqual(__version__, "0.1.1")
 
     def test_first_run_setup_gate_and_persistent_config(self):
         # Unconfigured run without explicit provider/model MUST return SETUP_REQUIRED (exit code 2)
@@ -370,7 +370,7 @@ class TestClaudeSubagent(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("0.1.0", vproc.stdout)
+        self.assertIn(__version__, vproc.stdout)
 
     def test_skill_frontmatter_and_relative_links(self):
         skill_dir = os.path.join(REPO_ROOT, "skills", "claude-subagent")
