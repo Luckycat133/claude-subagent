@@ -1,0 +1,14 @@
+# Exception Handling & Recovery Playbook
+
+Autonomous subagents fail in predictable ways. Classify the failure before reacting—never blindly retry the exact same command in a loop, and never give up prematurely on recoverable issues.
+
+| Exception Class | Detection Signal | Recovery Strategy |
+|---|---|---|
+| **1. First-run unconfigured (`SETUP_REQUIRED`)** | Exit code `2` or `claude-subagent config show` reports unconfigured | Run `claude-subagent setup --discover`, ask the user to confirm default model + delegation/usage policy, persist via `claude-subagent setup ...`, then proceed. Never silently guess a model. |
+| **2. Review findings / failing tests** | Reviewer flags concrete defects or verification tests fail | Resume the owning implementer (`-r <id>`) with exact `file:line` findings and failing output; re-verify and repeat until checks genuinely pass. Break out only on external blockers, ambiguous product requirements, or 2+ identical failures (change strategy or inspect directly). |
+| **3. User / host contention (GUI, desktop, shared editor)** | User is actively moving mouse/typing, window focus shifts unexpectedly, or app lock is held by user | **Yield immediately.** Pause automated GUI/host actions and wait or inform the user cleanly rather than fighting for focus or retrying aggressively. |
+| **4. Usage policy / scope reminder triggered** | Task hits a boundary noted in `policies.usagePolicy` (e.g., user asked to be reminded in certain situations) | Pause briefly to remind the user before dispatching, and proceed or adjust according to their reply. |
+| **5. Timeout or partial delivery** | Exit code `1` with `Timed out after Ns` or truncated progress | Inspect actual `git status --short` / `git diff` first—partial progress is often already saved on disk. Resume `-r <id>` with narrower remaining scope, raise `--timeout`, or split the task into smaller slices. |
+| **6. Write ownership or merge conflict** | Two workers touched overlapping code or worktree merge conflicts | Halt colliding writers, resolve integration at the coordinator level, and never silently overwrite another worker's or the user's uncommitted edits. |
+| **7. Provider outage / 429 rate limit / auth error** | HTTP 429/5xx, network timeout, or expired credentials | On transient network/429 errors, retry with bounded backoff. On auth/quota exhaustion, **never** silently switch to an unauthorized paid route—report the exact provider error and let the user choose. |
+| **8. Stale or wrong session context** | Resumed session goes off-track or carries conflicting prior assumptions | Start a fresh named session (`--title "..."`) with a clean outcome brief instead of continuing to patch a confused session, and optionally clean up with `--delete-session <id>`. |

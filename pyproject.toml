@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-subagent"
+version = "0.1.0"
+description = "Headless Claude Code subagent CLI & universal Agent Skill with persistent setup, numbered sessions, and git worktree isolation."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+  {name = "Luckycat133"}
+]
+keywords = [
+  "claude-code",
+  "subagent",
+  "agent-skill",
+  "multi-agent",
+  "ai-agents",
+  "cli",
+  "worktree",
+  "crouter",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Luckycat133/claude-subagent"
+Repository = "https://github.com/Luckycat133/claude-subagent"
+Issues = "https://github.com/Luckycat133/claude-subagent/issues"
+
+[project.scripts]
+claude-subagent = "claude_subagent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
