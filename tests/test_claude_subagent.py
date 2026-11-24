@@ -45,7 +45,18 @@ class TestClaudeSubagent(unittest.TestCase):
         return path
 
     def test_version_matches_semver(self):
-        self.assertEqual(__version__, "0.1.1")
+        self.assertEqual(__version__, "0.1.2")
+        pyproject = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pyproject.toml")
+        with open(pyproject, encoding="utf-8") as f:
+            self.assertIn(f'version = "{__version__}"', f.read())
+
+    def test_default_timeout_is_unlimited(self):
+        rc, out, _ = cli.run_subprocess_safely(["sh", "-c", 'printf "ok"'], cwd=self.tmp_dir, timeout=None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "ok")
+        rc2, out2, _ = cli.run_subprocess_safely(["sh", "-c", 'printf "ok0"'], cwd=self.tmp_dir, timeout=0)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(out2, "ok0")
 
     def test_first_run_setup_gate_and_persistent_config(self):
         # Unconfigured run without explicit provider/model MUST return SETUP_REQUIRED (exit code 2)

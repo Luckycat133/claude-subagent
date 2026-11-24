@@ -2,6 +2,12 @@
 
 All notable changes to `claude-subagent` are documented in this file.
 
+## [0.1.2] - 2026-11-24
+
+### Changed
+- Removed the hardcoded 300s default `--timeout` in `claude-subagent` (`cli.py`, `execute_subagent`, `run_subprocess_safely`) so local models and long cloud chains run without arbitrary interruption; `--timeout <sec>` remains available as an explicit opt-in (`0` or omitted disables timeout).
+- Added project-level distribution/packaging skills (`python-pypi-package-builder`, `directory-submissions`, `clawhub`, `github-release`) under `.agents/skills/` and `.claude/skills/`.
+
 ## [0.1.1] - 2026-11-23
 
 ### Changed

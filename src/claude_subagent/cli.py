@@ -992,11 +992,12 @@ def _signal_process_group(proc: subprocess.Popen, sig: int):
         pass
 
 
-def run_subprocess_safely(cmd, cwd, timeout):
+def run_subprocess_safely(cmd, cwd, timeout=None):
     """Launch cmd in its own process group; strip TMUX so tmux hooks never fire for headless runs."""
     env = os.environ.copy()
     env.pop("TMUX", None)
     env.pop("TMUX_PANE", None)
+    effective_timeout = timeout if (timeout is not None and timeout > 0) else None
     popen_kwargs = dict(
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -1008,7 +1009,7 @@ def run_subprocess_safely(cmd, cwd, timeout):
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(cmd, **popen_kwargs)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=effective_timeout)
         return proc.returncode, stdout, stderr
     except subprocess.TimeoutExpired:
         _signal_process_group(proc, signal.SIGINT)
@@ -1182,7 +1183,7 @@ def execute_subagent(
     model: str = None,
     provider: str = None,
     budget: float = None,
-    timeout: int = 300,
+    timeout: int = None,
     bare: bool = False,
     strict_mcp: bool = False,
     allowed_tools: str = None,
@@ -1592,7 +1593,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--budget", default=None, help="Max budget in USD (e.g. 0.50)"
     )
     parser.add_argument(
-        "--timeout", type=int, default=300, help="Command timeout in seconds (default: 300)"
+        "--timeout", type=int, default=None,
+        help="Optional command timeout in seconds (default: none / unlimited; pass 0 to disable)"
     )
     parser.add_argument(
         "--max-output-chars", type=int, default=15000,

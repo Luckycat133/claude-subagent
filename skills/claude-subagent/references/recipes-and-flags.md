@@ -106,7 +106,7 @@ claude-subagent --cwd "/abs/path/to/repo" --title "Check route" --dry-run -p "he
 | `--model <id>` | One-shot model override |
 | `--allow-unconfigured` | One-off bypass of first-run setup gate |
 | `--budget <usd>` | Pass `--max-budget-usd` spend ceiling |
-| `--timeout <sec>` | Process-group timeout in seconds (default: `300`) |
+| `--timeout <sec>` | Optional process-group timeout in seconds (default: unlimited; avoid setting arbitrary caps on local models or long chains) |
 | `--max-output-chars <n>` | Safety ceiling on delivery report length (default: `15000`) |
 | `--raw-json` | Print raw Claude JSON payload |
 | `--dry-run` | Print resolved route & command as JSON without invoking Claude |
