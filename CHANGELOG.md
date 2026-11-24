@@ -2,15 +2,20 @@
 
 All notable changes to `claude-subagent` are documented in this file.
 
+## [0.1.4] - 2026-11-24
+
+### Changed
+- Removed default delivery report truncation (`--max-output-chars` now defaults to unlimited and only caps output when explicitly passed).
+- Simplified `skills/claude-subagent/` guidance to remove rigid backend-specific concurrency rules and keep the skill general-purpose.
+
 ## [0.1.3] - 2026-11-24
 
 ### Added
 - Pre-assigned `--session-id <uuid>` for new sessions so interrupted or timed-out runs still preserve their numbered `#N` session entry and print an actionable `Resume:` command.
 - Automatic crash/timeout transcript recovery (`recover_session_telemetry`) from Claude Code's native session JSONL to surface actual executed `Model`, completed `turns`, and `Last Activity Before Interruption`.
-- Automatic archival of full uncut Markdown delivery reports to `~/.local/state/claude-subagent/reports/` whenever inline output hits the safety length ceiling, with the saved file path printed in the footer.
+- Automatic archival of full uncut Markdown delivery reports to `~/.local/state/claude-subagent/reports/` whenever inline output hit the length ceiling.
 
 ### Changed
-- Updated `skills/claude-subagent/` (`SKILL.md` and `references/exception-handling.md`) with local single-GPU concurrency guardrails (avoiding multi-worker queue starvation on Ollama/local backends) and explicit guidance against setting arbitrary short `--timeout` caps.
 - Synchronized `README.md` and `README.zh-CN.md` version badges to `0.1.3`.
 
 ## [0.1.2] - 2026-11-24

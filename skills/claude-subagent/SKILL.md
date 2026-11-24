@@ -42,18 +42,17 @@ When `delegationMode` is `proactive`, **initiate delegation on your own without 
 See [Team Topologies](references/team-topologies.md) for topologies and handoff templates.
 
 1. **Preflight**: Check `git status --short`, `git worktree list`, and `git remote -v` (in multi-repo workspaces, do not edit third-party clones unless explicitly requested).
-2. **Partition by Write Boundaries, Backend Concurrency & Dependencies**:
-   - Keep teams small (usually **2–4 workers** on cloud/API backends).
-   - **Respect local single-GPU backends**: if `config show` routes to a local model (`ollama`, `lmstudio`, `bonsai`, etc.), run **1 worker at a time (at most 2)**—fanning out 4–5 parallel workers onto one local GPU causes severe queueing stalls.
+2. **Partition by Write Boundaries & Dependencies**:
+   - Keep teams small (usually **2–4 workers**) and match concurrency to your backend's capacity.
    - Enforce **single-writer ownership** per file, artifact, port, or service. When parallel writers touch the same git repo, isolate each in a worktree (`-w <name>`) so git diffs stay separated.
    - Stage dependent phases cleanly (e.g. scout → parallel implementers → independent reviewer → coordinator merge).
 3. **Brief for Outcomes, Not Micromanagement**:
    - State the **goal, acceptance criteria, write scope (owned vs. off-limits paths), and verification command**.
    - **Do not micromanage** step-by-step instructions or dump redundant prose the worker can read from the repo itself. Only add non-obvious constraints, repro details, or required invariants.
    - Always pass `--cwd <abs_path>`, a distinct `--title "<short task>"`, and `-p - <<'EOF' ... EOF` for multi-line briefs.
-4. **Permissions, Timeouts & Least-Privilege Scoping**:
+4. **Permissions & Least-Privilege Scoping**:
    - Headless `claude -p` defaults to `bypassPermissions` so workers execute unattended without stalling on interactive prompts or burning parent tokens.
-   - **Do not set arbitrary short `--timeout` caps** (default is unlimited). Multi-turn refactors and large test suites frequently take 5–10+ minutes; only pass `--timeout` when the user explicitly wants a hard wall-clock cutoff.
+   - Timeout and output length are **unlimited by default**—only pass `--timeout` or `--max-output-chars` if explicitly desired.
    - Enforce safety through **scope, not prompts**: `--allowed-tools readonly --strict-mcp` for scouts/reviewers, `--allowed-tools coding` for writers, `-w <name>` for git isolation, and optional `--budget`.
 
 ## 4. Handle Exceptions & Verify Before Delivery
@@ -62,5 +61,5 @@ See [Exception Handling Playbook](references/exception-handling.md) for full rec
 
 - **Review / test failures**: Do not stop at a failing review—resume the owning session (`-r <id>`) with concrete findings and iterate until checks pass. Break out only on external blockers, genuine design ambiguity, or repeated identical failures requiring a new strategy.
 - **User / host contention** (e.g. GUI / Computer Use or shared active workspace): If the user is actively operating the desktop or target app, **yield and pause immediately** rather than fighting for focus.
-- **Interrupted runs / truncated reports**: New sessions pre-assign a `--session-id` so interrupted runs still record `#N`, recover last activity from the transcript, and print a ready-to-run `-r <id>` resume command. When long reports exceed `--max-output-chars`, read the archived full report path printed in the footer instead of re-running the worker.
+- **Interrupted runs**: New sessions pre-assign a `--session-id` so interrupted runs still record `#N`, recover last activity from the transcript, and print a ready-to-run `-r <id>` resume command.
 - **Always verify independently**: Inspect actual `git status --short`, `git diff --stat`, worktree merge state (worktree edits are not on the main branch until merged), and test exit codes before declaring completion.

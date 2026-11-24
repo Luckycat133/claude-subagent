@@ -896,30 +896,6 @@ def clean_output(raw_text: str):
     return None
 
 
-def get_reports_dir() -> str:
-    """Resolve directory for saving full uncut reports when inline output hits safety ceiling."""
-    state_dir = get_state_dir()
-    return os.path.join(os.path.dirname(os.path.abspath(state_dir)), "reports")
-
-
-def save_full_report(text: str, session_num=None) -> str:
-    """Save full uncut Markdown report to disk and return its path (or '' on error)."""
-    try:
-        reports_dir = get_reports_dir()
-        os.makedirs(reports_dir, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        tag = f"s{session_num}" if session_num is not None else "run"
-        fname = f"report_{tag}_{ts}_{os.getpid()}.md"
-        path = os.path.join(reports_dir, fname)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
-        return path
-    except Exception:
-        return ""
-
-
 def _encode_claude_project_dir(cwd: str) -> str:
     return re.sub(r"[^a-zA-Z0-9-]", "-", os.path.abspath(cwd))
 
@@ -1067,11 +1043,10 @@ def truncate_error(text: str, max_lines: int = 12) -> str:
 
 def format_delivery_report(
     text: str,
-    max_lines: int = 250,
-    max_chars: int = 15000,
-    session_num=None,
+    max_lines: int = None,
+    max_chars: int = None,
 ) -> str:
-    """Clean and preserve full substantive Markdown delivery; archive uncut report if safety ceiling is hit."""
+    """Clean and return the full Markdown delivery report (no truncation unless explicitly requested)."""
     cleaned = ANSI_ESCAPE.sub("", text or "").strip()
     filtered_lines = []
     for line in cleaned.splitlines():
@@ -1083,16 +1058,13 @@ def format_delivery_report(
         return "Subagent completed the task with no text output."
 
     joined = "\n".join(filtered_lines)
-    if len(filtered_lines) > max_lines or len(joined) > max_chars:
-        saved_path = save_full_report(joined, session_num=session_num)
-        truncated = "\n".join(filtered_lines[:max_lines])
-        if len(truncated) > max_chars:
+    over_lines = bool(max_lines and max_lines > 0 and len(filtered_lines) > max_lines)
+    over_chars = bool(max_chars and max_chars > 0 and len(joined) > max_chars)
+    if over_lines or over_chars:
+        truncated = "\n".join(filtered_lines[:max_lines]) if over_lines else joined
+        if max_chars and max_chars > 0 and len(truncated) > max_chars:
             truncated = truncated[:max_chars].rstrip()
-        saved_note = f" Full uncut report saved to: `{saved_path}`" if saved_path else ""
-        return (
-            truncated
-            + f"\n\n... (Delivery report capped at {max_lines} lines / {max_chars} chars for context safety.{saved_note})"
-        )
+        return truncated + "\n\n... (Delivery report capped per explicit --max-output-chars limit)"
 
     return joined
 
@@ -1321,7 +1293,7 @@ def execute_subagent(
     append_system_prompt: str = None,
     permission_mode: str = None,
     allow_unconfigured: bool = False,
-    max_output_chars: int = 15000,
+    max_output_chars: int = None,
     raw_json: bool = False,
     dry_run: bool = False,
 ) -> tuple:
@@ -1510,7 +1482,7 @@ def execute_subagent(
         lines.append(truncate_error(error_blob))
     else:
         lines.append("**Subagent Delivery & Review Report:**")
-        lines.append(format_delivery_report(result_text, max_chars=max_output_chars, session_num=numeric_id))
+        lines.append(format_delivery_report(result_text, max_chars=max_output_chars))
 
     return (0 if success else 1), "\n".join(lines)
 
@@ -1755,8 +1727,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional command timeout in seconds (default: none / unlimited; pass 0 to disable)"
     )
     parser.add_argument(
-        "--max-output-chars", type=int, default=15000,
-        help="Safety cap on delivery report length in chars (default: 15000)"
+        "--max-output-chars", type=int, default=None,
+        help="Optional cap on delivery report length in chars (default: unlimited)"
     )
     parser.add_argument(
         "--allowed-tools", default=None,

@@ -45,7 +45,7 @@ class TestClaudeSubagent(unittest.TestCase):
         return path
 
     def test_version_matches_semver(self):
-        self.assertEqual(__version__, "0.1.3")
+        self.assertEqual(__version__, "0.1.4")
         pyproject = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pyproject.toml")
         with open(pyproject, encoding="utf-8") as f:
             self.assertIn(f'version = "{__version__}"', f.read())
@@ -91,17 +91,18 @@ class TestClaudeSubagent(unittest.TestCase):
         self.assertEqual(rec.get("num_turns"), 2)
         self.assertIn("Tool `Bash`: pytest -q", rec.get("last_activity", ""))
 
-    def test_truncation_archives_full_uncut_report(self):
+    def test_delivery_report_uncut_by_default_and_optional_cap(self):
         long_text = "\n".join(f"Line {i}: details about change {i}" for i in range(400))
-        out = cli.format_delivery_report(long_text, max_lines=20, max_chars=500, session_num=7)
-        self.assertIn("Full uncut report saved to:", out)
-        m = re.search(r"Full uncut report saved to: `([^`]+)`", out)
-        self.assertIsNotNone(m, out)
-        saved_path = m.group(1)
-        self.assertTrue(os.path.isfile(saved_path))
-        with open(saved_path, encoding="utf-8") as f:
-            saved_body = f.read()
-        self.assertIn("Line 399: details about change 399", saved_body)
+        # Default: full uncut output, no truncation
+        uncut = cli.format_delivery_report(long_text)
+        self.assertIn("Line 0: details about change 0", uncut)
+        self.assertIn("Line 399: details about change 399", uncut)
+        self.assertNotIn("capped", uncut)
+
+        # Explicit --max-output-chars still works as opt-in
+        capped = cli.format_delivery_report(long_text, max_chars=500)
+        self.assertIn("Delivery report capped", capped)
+        self.assertNotIn("Line 399", capped)
 
     def test_default_timeout_is_unlimited(self):
         rc, out, _ = cli.run_subprocess_safely(["sh", "-c", 'printf "ok"'], cwd=self.tmp_dir, timeout=None)
