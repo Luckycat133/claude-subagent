@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 try:
     import fcntl
@@ -895,6 +896,113 @@ def clean_output(raw_text: str):
     return None
 
 
+def get_reports_dir() -> str:
+    """Resolve directory for saving full uncut reports when inline output hits safety ceiling."""
+    state_dir = get_state_dir()
+    return os.path.join(os.path.dirname(os.path.abspath(state_dir)), "reports")
+
+
+def save_full_report(text: str, session_num=None) -> str:
+    """Save full uncut Markdown report to disk and return its path (or '' on error)."""
+    try:
+        reports_dir = get_reports_dir()
+        os.makedirs(reports_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        tag = f"s{session_num}" if session_num is not None else "run"
+        fname = f"report_{tag}_{ts}_{os.getpid()}.md"
+        path = os.path.join(reports_dir, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+        return path
+    except Exception:
+        return ""
+
+
+def _encode_claude_project_dir(cwd: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9-]", "-", os.path.abspath(cwd))
+
+
+def recover_session_telemetry(cwd: str, session_uuid: str, claude_projects_dir: str = None) -> dict:
+    """Inspect Claude Code's native session JSONL on timeout/crash to recover model, turns, and last activity."""
+    if not session_uuid:
+        return {}
+    projects_root = claude_projects_dir or os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_root):
+        return {}
+
+    candidates = []
+    for path_variant in (os.path.abspath(cwd), os.path.realpath(cwd)):
+        encoded = _encode_claude_project_dir(path_variant)
+        cand = os.path.join(projects_root, encoded, f"{session_uuid}.jsonl")
+        if cand not in candidates:
+            candidates.append(cand)
+
+    transcript_path = next((p for p in candidates if os.path.isfile(p)), None)
+    if not transcript_path:
+        return {}
+
+    model = None
+    num_turns = 0
+    last_activity = None
+
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+
+                etype = entry.get("type")
+                if etype == "cost-state":
+                    mu = entry.get("modelUsage")
+                    if isinstance(mu, dict) and mu:
+                        model = list(mu.keys())[0]
+                elif etype == "assistant":
+                    num_turns += 1
+                    msg = entry.get("message")
+                    if isinstance(msg, dict):
+                        if msg.get("model"):
+                            model = msg.get("model")
+                        content = msg.get("content")
+                        if isinstance(content, list):
+                            for block in reversed(content):
+                                if not isinstance(block, dict):
+                                    continue
+                                btype = block.get("type")
+                                if btype == "tool_use":
+                                    tname = block.get("name", "tool")
+                                    tinp = block.get("input") or {}
+                                    hint = ""
+                                    for key in ("command", "file_path", "path", "pattern"):
+                                        if isinstance(tinp, dict) and tinp.get(key):
+                                            hint = str(tinp[key]).splitlines()[0][:120]
+                                            break
+                                    last_activity = f"Tool `{tname}`" + (f": {hint}" if hint else "")
+                                    break
+                                if btype == "text" and block.get("text", "").strip():
+                                    txt_line = [l.strip() for l in block["text"].splitlines() if l.strip()][-1]
+                                    last_activity = txt_line[:200]
+                                    break
+    except Exception:
+        return {"exists": True, "transcript_path": transcript_path}
+
+    return {
+        "exists": True,
+        "transcript_path": transcript_path,
+        "model": model,
+        "num_turns": num_turns,
+        "last_activity": last_activity,
+    }
+
+
 def extract_actual_model(payload: dict, fallback_model: str) -> str:
     """Extract canonical model name actually executed from Claude Code payload."""
     if payload and isinstance(payload, dict):
@@ -906,7 +1014,13 @@ def extract_actual_model(payload: dict, fallback_model: str) -> str:
     return fallback_model or "default"
 
 
-def format_metrics(payload: dict, elapsed_sec: float, actual_model: str = None, provider: str = None) -> str:
+def format_metrics(
+    payload: dict,
+    elapsed_sec: float,
+    actual_model: str = None,
+    provider: str = None,
+    recovered_turns: int = None,
+) -> str:
     """Build concise telemetry snippet: duration, turns, optional cost (omitting fake USD on :free/local)."""
     parts = []
     duration_ms = payload.get("duration_ms") if isinstance(payload, dict) else None
@@ -916,6 +1030,8 @@ def format_metrics(payload: dict, elapsed_sec: float, actual_model: str = None, 
         parts.append(f"{elapsed_sec:.1f}s")
 
     num_turns = payload.get("num_turns") if isinstance(payload, dict) else None
+    if not (isinstance(num_turns, int) and num_turns > 0) and isinstance(recovered_turns, int) and recovered_turns > 0:
+        num_turns = recovered_turns
     if isinstance(num_turns, int) and num_turns > 0:
         parts.append(f"{num_turns} turn{'s' if num_turns != 1 else ''}")
 
@@ -949,8 +1065,13 @@ def truncate_error(text: str, max_lines: int = 12) -> str:
     return "\n".join("  " + line for line in lines[-max_lines:])
 
 
-def format_delivery_report(text: str, max_lines: int = 250, max_chars: int = 15000) -> str:
-    """Clean and preserve full substantive Markdown delivery with token safety ceiling."""
+def format_delivery_report(
+    text: str,
+    max_lines: int = 250,
+    max_chars: int = 15000,
+    session_num=None,
+) -> str:
+    """Clean and preserve full substantive Markdown delivery; archive uncut report if safety ceiling is hit."""
     cleaned = ANSI_ESCAPE.sub("", text or "").strip()
     filtered_lines = []
     for line in cleaned.splitlines():
@@ -963,12 +1084,14 @@ def format_delivery_report(text: str, max_lines: int = 250, max_chars: int = 150
 
     joined = "\n".join(filtered_lines)
     if len(filtered_lines) > max_lines or len(joined) > max_chars:
+        saved_path = save_full_report(joined, session_num=session_num)
         truncated = "\n".join(filtered_lines[:max_lines])
         if len(truncated) > max_chars:
             truncated = truncated[:max_chars].rstrip()
+        saved_note = f" Full uncut report saved to: `{saved_path}`" if saved_path else ""
         return (
             truncated
-            + f"\n\n... (Delivery report capped at {max_lines} lines / {max_chars} chars for context safety; inspect modified files for full code)"
+            + f"\n\n... (Delivery report capped at {max_lines} lines / {max_chars} chars for context safety.{saved_note})"
         )
 
     return joined
@@ -1059,6 +1182,7 @@ def build_command(
     model: str = None,
     resume_uuid: str = None,
     continue_session: bool = False,
+    session_id: str = None,
     worktree=None,
     budget=None,
     bare: bool = False,
@@ -1125,6 +1249,8 @@ def build_command(
         claude_args.extend(["--resume", resume_uuid])
     elif continue_session:
         claude_args.append("--continue")
+    elif session_id:
+        claude_args.extend(["--session-id", session_id])
 
     if str(worktree).lower() in ("true", "1") or worktree is True:
         claude_args.append("--worktree")
@@ -1238,6 +1364,9 @@ def execute_subagent(
     elif continue_session:
         target_session_uuid, target_numeric_id, target_title = resolve_session(target_cwd, "latest")
 
+    # Pre-assign a deterministic UUID for new sessions so interrupted/timed-out runs stay resumable
+    pre_session_uuid = None if (target_session_uuid or continue_session) else str(uuid.uuid4())
+
     try:
         cmd = build_command(
             prompt=prompt,
@@ -1246,6 +1375,7 @@ def execute_subagent(
             model=eff_model,
             resume_uuid=target_session_uuid,
             continue_session=continue_session,
+            session_id=pre_session_uuid,
             worktree=worktree,
             budget=budget,
             bare=bare,
@@ -1271,6 +1401,7 @@ def execute_subagent(
                 "provider": eff_provider,
                 "model": eff_model,
                 "permissionMode": eff_permission_mode,
+                "sessionId": target_session_uuid or pre_session_uuid,
                 "command": cmd,
                 "shell": " ".join(shlex.quote(x) for x in cmd),
             },
@@ -1306,10 +1437,25 @@ def execute_subagent(
 
     success = returncode == 0 and payload is not None and not payload.get("is_error")
     status_label = "SUCCESS" if success else "FAILED"
-    actual_model = extract_actual_model(payload, eff_model or eff_provider or "default")
+
+    candidate_uuid = (payload.get("session_id") if payload else None) or target_session_uuid or pre_session_uuid
+    recovered = {}
+    if payload is None and candidate_uuid:
+        recovered = recover_session_telemetry(git_inspect_dir, candidate_uuid)
+        if not recovered and git_inspect_dir != target_cwd:
+            recovered = recover_session_telemetry(target_cwd, candidate_uuid)
+
+    cfg_default_model = ((config or {}).get("defaultRoute") or {}).get("model") if not model else None
+    model_fallback = recovered.get("model") or eff_model or cfg_default_model or eff_provider or "default"
+    actual_model = extract_actual_model(payload, model_fallback)
     result_text = payload.get("result", "") if payload else (stdout.strip() or stderr.strip())
 
-    session_uuid = payload.get("session_id") if payload else target_session_uuid
+    should_record = bool(
+        (payload and payload.get("session_id"))
+        or target_session_uuid
+        or recovered.get("exists")
+    )
+    session_uuid = candidate_uuid if should_record else None
     numeric_id, resolved_title = record_session(
         target_cwd,
         session_uuid,
@@ -1324,7 +1470,13 @@ def execute_subagent(
     display_title = resolved_title or target_title or ""
     session_label = f"#{numeric_id} (\"{display_title}\")" if numeric_id else (f"\"{display_title}\"" if display_title else "")
     session_str = f" Session {session_label} |" if session_label else ""
-    metrics_str = format_metrics(payload, elapsed_sec, actual_model=actual_model, provider=eff_provider)
+    metrics_str = format_metrics(
+        payload,
+        elapsed_sec,
+        actual_model=actual_model,
+        provider=eff_provider,
+        recovered_turns=recovered.get("num_turns"),
+    )
     metrics_suffix = f" | {metrics_str}" if metrics_str else ""
     lines.append(f"### [Claude Subagent: {status_label}]{session_str} Model: `{actual_model}`{metrics_suffix}")
 
@@ -1342,6 +1494,12 @@ def execute_subagent(
         lines.append("")
 
     if not success:
+        if recovered.get("last_activity"):
+            lines.append(f"**Last Activity Before Interruption:** {recovered['last_activity']}")
+        if numeric_id:
+            lines.append(
+                f"**Resume:** `claude-subagent --cwd {shlex.quote(target_cwd)} -r {numeric_id} -p \"Continue from where you stopped.\"`"
+            )
         lines.append("**Error (Actionable Details):**")
         if payload and payload.get("is_error") and payload.get("result"):
             error_blob = str(payload.get("result"))
@@ -1352,7 +1510,7 @@ def execute_subagent(
         lines.append(truncate_error(error_blob))
     else:
         lines.append("**Subagent Delivery & Review Report:**")
-        lines.append(format_delivery_report(result_text, max_chars=max_output_chars))
+        lines.append(format_delivery_report(result_text, max_chars=max_output_chars, session_num=numeric_id))
 
     return (0 if success else 1), "\n".join(lines)
 

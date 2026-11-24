@@ -45,10 +45,63 @@ class TestClaudeSubagent(unittest.TestCase):
         return path
 
     def test_version_matches_semver(self):
-        self.assertEqual(__version__, "0.1.2")
+        self.assertEqual(__version__, "0.1.3")
         pyproject = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pyproject.toml")
         with open(pyproject, encoding="utf-8") as f:
             self.assertIn(f'version = "{__version__}"', f.read())
+
+    def test_preassigned_session_id_and_transcript_recovery(self):
+        # New session passes --session-id; resumed session uses --resume instead
+        cmd_new = cli.build_command(
+            prompt="hi", backend="native", session_id="11111111-2222-3333-4444-555555555555",
+            crouter_path="", claude_path="claude",
+        )
+        self.assertIn("--session-id", cmd_new)
+        self.assertIn("11111111-2222-3333-4444-555555555555", cmd_new)
+
+        cmd_res = cli.build_command(
+            prompt="hi", backend="native", resume_uuid="11111111-2222-3333-4444-555555555555",
+            session_id="99999999-2222-3333-4444-555555555555",
+            crouter_path="", claude_path="claude",
+        )
+        self.assertIn("--resume", cmd_res)
+        self.assertNotIn("--session-id", cmd_res)
+
+        # Simulate a Claude Code native JSONL written before a timeout/SIGKILL
+        fake_projects = os.path.join(self.tmp_dir, "claude_projects")
+        ws = os.path.join(self.tmp_dir, "demo_repo")
+        os.makedirs(ws)
+        enc = cli._encode_claude_project_dir(ws)
+        proj_dir = os.path.join(fake_projects, enc)
+        os.makedirs(proj_dir)
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        jsonl_path = os.path.join(proj_dir, f"{sid}.jsonl")
+        entries = [
+            {"type": "assistant", "message": {"model": "nvidia/nemotron-3.5-super-vl:free", "content": [{"type": "text", "text": "Reading files"}]}},
+            {"type": "assistant", "message": {"model": "nvidia/nemotron-3.5-super-vl:free", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}}]}},
+            {"type": "cost-state", "modelUsage": {"nvidia/nemotron-3.5-super-vl:free": {"inputTokens": 100}}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        rec = cli.recover_session_telemetry(ws, sid, claude_projects_dir=fake_projects)
+        self.assertTrue(rec.get("exists"))
+        self.assertEqual(rec.get("model"), "nvidia/nemotron-3.5-super-vl:free")
+        self.assertEqual(rec.get("num_turns"), 2)
+        self.assertIn("Tool `Bash`: pytest -q", rec.get("last_activity", ""))
+
+    def test_truncation_archives_full_uncut_report(self):
+        long_text = "\n".join(f"Line {i}: details about change {i}" for i in range(400))
+        out = cli.format_delivery_report(long_text, max_lines=20, max_chars=500, session_num=7)
+        self.assertIn("Full uncut report saved to:", out)
+        m = re.search(r"Full uncut report saved to: `([^`]+)`", out)
+        self.assertIsNotNone(m, out)
+        saved_path = m.group(1)
+        self.assertTrue(os.path.isfile(saved_path))
+        with open(saved_path, encoding="utf-8") as f:
+            saved_body = f.read()
+        self.assertIn("Line 399: details about change 399", saved_body)
 
     def test_default_timeout_is_unlimited(self):
         rc, out, _ = cli.run_subprocess_safely(["sh", "-c", 'printf "ok"'], cwd=self.tmp_dir, timeout=None)
