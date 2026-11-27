@@ -47,7 +47,6 @@ echo "Installed CLI: $BIN_DIR/claude-subagent -> $SCRIPT_DIR/bin/claude-subagent
 if [ "$INSTALL_ALL" -eq 1 ] && [ ${#SKILL_DIRS[@]} -eq 0 ]; then
   for candidate in \
     "${HOME}/.agents/skills" \
-    "${HOME}/.claude/skills" \
     "${HOME}/.gemini/config/skills" \
     "${HOME}/.codex/skills"; do
     if [ -d "$candidate" ]; then
@@ -60,8 +59,9 @@ for sdir in "${SKILL_DIRS[@]:-}"; do
   [ -n "$sdir" ] || continue
   mkdir -p "$sdir"
   target="$sdir/claude-subagent"
-  ln -sfn "$SCRIPT_DIR/skills/claude-subagent" "$target"
-  echo "Installed skill: $target -> $SCRIPT_DIR/skills/claude-subagent"
+  rm -rf "$target"
+  cp -R "$SCRIPT_DIR/skills/claude-subagent" "$target"
+  echo "Installed skill: $target (copied from $SCRIPT_DIR/skills/claude-subagent)"
 done
 
 if [ "$INSTALL_AGENTS" -eq 1 ]; then

@@ -2,18 +2,21 @@
 """
 Headless Claude Code Subagent Runner (`claude-subagent`).
 
-Turns Claude Code (native or paired with `crouter`) into a persistent, stateful,
-worktree-isolated worker CLI for any orchestrating AI agent or developer workflow.
+Native-grade subagent CLI for Codex, Antigravity, Cursor, Gemini CLI, and terminal
+workflows. Zero external dependencies (Python 3.9+ stdlib only).
 
 Highlights:
-  * First-run discovery & persistent setup (~/.config/claude-subagent/config.json):
-    records confirmed default model/provider, delegation/usage policy, and optional
-    per-scenario overrides so agents never silently pick an unconfirmed model.
-  * Works out of the box with native `claude`; pairs seamlessly with `crouter`.
-  * Zero permanent MCP overhead (Skill + CLI architecture, Python 3.9+ stdlib only).
-  * File-locked atomic numbered sessions (#1, #2, ...) per workspace.
-  * Worktree-aware & dirty-tree-delta Git change reporting.
-  * Process-group timeout teardown (SIGINT -> SIGTERM -> SIGKILL) to prevent orphans.
+  * Minimal native-like interface: `claude-subagent "task"`, `send <id> "msg"`,
+    `fork <id> "msg"`, `ps`, `show <id>`, `stop <id>`, `rm <id>`, `models`, `doctor`.
+  * Target-workspace session binding: binds `#1`, `#2`, `-c`, `send`, and `ps`
+    strictly to the specified target workspace (`-C` / `--cwd` / `--workspace`),
+    normalized via `realpath` so every IDE works identically without host adapters.
+  * Flexible model selection with preserved default: keeps configured default
+    (`openrouter` / `nvidia/nemotron-3.5-super-vl:free`) while supporting one-shot
+    `-m <model>` (auto-routing native `sonnet`/`opus`/`haiku`/`fable`/`claude-*`
+    or inheriting `defaultRoute.provider`), `--provider <p>`, and `models`.
+  * Fast headless defaults (`--strict-mcp-config`, `--no-chrome`, `bypassPermissions`)
+    and live `stream-json` `stderr` progress with crash-safe telemetry recovery.
 """
 
 import argparse
@@ -29,6 +32,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -59,6 +63,8 @@ PERMISSION_MODES = [
 ]
 
 DELEGATION_MODES = ["proactive", "ask-first", "explicit-only"]
+
+NATIVE_CLAUDE_MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable")
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +275,7 @@ def discover_environment(crouter_path: str = None, claude_path: str = None) -> d
 
     cfg = load_config()
     return {
+        "version": __version__,
         "configPath": get_config_path(),
         "configured": cfg is not None,
         "config": cfg,
@@ -338,7 +345,7 @@ def format_setup_required_message(env_info: dict) -> str:
         "  --usage-policy \"<optional user rules or reminders>\"",
         "```",
         "",
-        "*(Or pass explicit `--provider`/`--model`, or `--allow-unconfigured` for a one-off bypass.)*",
+        "*(Or pass explicit `--provider`/`-m`, or `--allow-unconfigured` for a one-off bypass.)*",
     ]
     return "\n".join(lines)
 
@@ -352,6 +359,7 @@ def build_config_payload(
     scenario_overrides: dict = None,
     permission_mode: str = "bypassPermissions",
     note: str = None,
+    strict_mcp: bool = True,
 ) -> dict:
     """Create normalized schemaVersion=1 config dict."""
     norm_backend = (backend or "native").strip().lower()
@@ -374,10 +382,18 @@ def build_config_payload(
         "policies": {
             "delegationMode": delegation_mode or "proactive",
             "permissionMode": permission_mode or "bypassPermissions",
+            "strictMcp": bool(strict_mcp),
             "usagePolicy": (usage_policy or "").strip(),
             "scenarioOverrides": scenario_overrides or {},
         },
     }
+
+
+def _is_native_claude_model(model: str) -> bool:
+    norm = (model or "").strip().lower()
+    if not norm:
+        return False
+    return norm in NATIVE_CLAUDE_MODEL_ALIASES or norm.startswith("claude-")
 
 
 def resolve_effective_route(
@@ -397,17 +413,30 @@ def resolve_effective_route(
         raise RuntimeError("SETUP_REQUIRED")
 
     policies = (config or {}).get("policies") or {}
+    default_route = (config or {}).get("defaultRoute") or {}
     cfg_perm = policies.get("permissionMode") or "bypassPermissions"
 
     if explicit_override:
-        backend = "native" if cli_provider == "claude" else ("crouter" if find_crouter() else "native")
-        return backend, cli_provider, cli_model, cfg_perm, "cli-override"
+        if cli_provider:
+            backend = "native" if cli_provider == "claude" else ("crouter" if find_crouter() else "native")
+            return backend, cli_provider, cli_model, cfg_perm, "cli-override"
+
+        # -m/--model without --provider: auto-route native Claude aliases/models, else inherit default provider
+        if _is_native_claude_model(cli_model):
+            return "native", "claude", cli_model, cfg_perm, "cli-override"
+
+        inherited_provider = default_route.get("provider")
+        inherited_backend = default_route.get("backend")
+        if inherited_backend:
+            backend = inherited_backend
+        else:
+            backend = "native" if inherited_provider == "claude" else ("crouter" if find_crouter() else "native")
+        return backend, inherited_provider, cli_model, cfg_perm, "cli-override"
 
     if config is None:
         backend = "crouter" if find_crouter() else "native"
         return backend, None, None, cfg_perm, "unconfigured-bypass"
 
-    default_route = config.get("defaultRoute") or {}
     scenario_overrides = policies.get("scenarioOverrides") or {}
 
     if agent and agent in scenario_overrides and isinstance(scenario_overrides[agent], dict):
@@ -431,14 +460,26 @@ def resolve_effective_route(
 
 
 # ---------------------------------------------------------------------------
-# Session Registry Management (Locked & Atomic)
+# Target-Workspace Session Registry Management (Locked, Atomic, Realpath-Canonical)
 # ---------------------------------------------------------------------------
 
 def get_registry_path(cwd: str) -> str:
     state_dir = get_state_dir()
     os.makedirs(state_dir, exist_ok=True)
-    dir_hash = hashlib.md5(os.path.abspath(cwd).encode("utf-8")).hexdigest()[:12]
-    return os.path.join(state_dir, f"registry_{dir_hash}.json")
+    real_cwd = os.path.realpath(cwd)
+    real_hash = hashlib.md5(real_cwd.encode("utf-8")).hexdigest()[:12]
+    real_path = os.path.join(state_dir, f"registry_{real_hash}.json")
+    if os.path.exists(real_path):
+        return real_path
+
+    abs_cwd = os.path.abspath(cwd)
+    if abs_cwd != real_cwd:
+        legacy_hash = hashlib.md5(abs_cwd.encode("utf-8")).hexdigest()[:12]
+        legacy_path = os.path.join(state_dir, f"registry_{legacy_hash}.json")
+        if os.path.exists(legacy_path):
+            return legacy_path
+
+    return real_path
 
 
 def _read_registry_unlocked(reg_path: str, cwd: str) -> dict:
@@ -447,12 +488,16 @@ def _read_registry_unlocked(reg_path: str, cwd: str) -> dict:
             with open(reg_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    data.setdefault("cwd", os.path.abspath(cwd))
+                    data.setdefault("cwd", os.path.realpath(cwd))
                     data.setdefault("sessions", [])
                     return data
         except Exception:
             pass
-    return {"cwd": os.path.abspath(cwd), "sessions": []}
+    return {"cwd": os.path.realpath(cwd), "sessions": []}
+
+
+def _stamp_registry_meta(reg: dict):
+    reg["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_registry(cwd: str) -> dict:
@@ -466,11 +511,26 @@ def load_registry(cwd: str) -> dict:
 
 def save_registry(cwd: str, data: dict):
     reg_path = get_registry_path(cwd)
+    _stamp_registry_meta(data)
     try:
         with _file_lock(reg_path + ".lock", exclusive=True):
             _write_json_atomic(reg_path, data)
     except Exception:
         _write_json_atomic(reg_path, data)
+
+
+def _is_pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def make_title(prompt: str, custom_title: str = None) -> str:
@@ -492,43 +552,122 @@ def make_title(prompt: str, custom_title: str = None) -> str:
     return first_line
 
 
-def get_sessions_text(cwd: str) -> str:
-    """Return human/agent-readable string listing numbered sessions."""
-    reg = load_registry(cwd)
-    sessions = reg.get("sessions", [])
-    if not sessions:
-        return f"No subagent sessions recorded for: {os.path.abspath(cwd)}"
+def _enrich_session_entry(s: dict, workspace_cwd: str = None) -> dict:
+    entry = dict(s)
+    raw_status = entry.get("status") or "completed"
+    pid = entry.get("pid")
+    if raw_status == "running":
+        if pid and not _is_pid_alive(pid):
+            entry["effective_status"] = "interrupted"
+            entry["stale_pid"] = True
+        else:
+            entry["effective_status"] = "running"
+            entry["stale_pid"] = False
+    else:
+        entry["effective_status"] = raw_status
+        entry["stale_pid"] = False
+    if workspace_cwd:
+        entry["cwd"] = workspace_cwd
+    return entry
 
-    out = [f"### Subagent Sessions for `{os.path.abspath(cwd)}`:"]
+
+def get_sessions_data(cwd: str) -> list:
+    """Return session dicts enriched with effective live/stale-PID status for target workspace."""
+    reg = load_registry(cwd)
+    ws_cwd = reg.get("cwd") or os.path.realpath(cwd)
+    return [_enrich_session_entry(s, workspace_cwd=ws_cwd) for s in reg.get("sessions", [])]
+
+
+def list_all_sessions() -> list:
+    """List sessions across all tracked target workspaces."""
+    state_dir = get_state_dir()
+    if not os.path.isdir(state_dir):
+        return []
+    results = []
+    for fname in sorted(os.listdir(state_dir)):
+        if not (fname.startswith("registry_") and fname.endswith(".json")):
+            continue
+        fpath = os.path.join(state_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+            continue
+        ws_cwd = data.get("cwd") or ""
+        for s in data["sessions"]:
+            item = _enrich_session_entry(s, workspace_cwd=ws_cwd)
+            item["registryPath"] = fpath
+            results.append(item)
+    return results
+
+
+def _format_sessions_lines(sessions: list, header: str, show_cwd: bool = False) -> str:
+    out = [header]
     for s in sessions:
         sid = s.get("id")
         title = s.get("title", "Untitled")
         updated = s.get("updated_at", s.get("created_at", "N/A"))
         turns = s.get("turns", 1)
         model = s.get("model", "default")
+        status = s.get("effective_status", "completed")
+        if s.get("stale_pid"):
+            status_label = "interrupted (stale pid)"
+        elif status == "running" and s.get("pid"):
+            status_label = f"running pid={s['pid']}"
+        else:
+            status_label = status
         wt = s.get("worktree_path")
         wt_suffix = f" | Worktree: `{wt}`" if wt else ""
-        out.append(f"- **#{sid}** [{updated}] {title} (Turns: {turns} | Model: `{model}`{wt_suffix})")
+        cwd_prefix = f"[`{s.get('cwd')}`] " if (show_cwd and s.get("cwd")) else ""
+        out.append(
+            f"- {cwd_prefix}**#{sid}** [{updated}] {title} ({status_label} | Turns: {turns} | Model: `{model}`{wt_suffix})"
+        )
     return "\n".join(out)
 
 
-def list_sessions(cwd: str):
-    print(get_sessions_text(cwd))
+def get_sessions_text(cwd: str, show_all: bool = False) -> str:
+    """Return human/agent-readable string listing numbered sessions."""
+    real_cwd = os.path.realpath(cwd)
+    if show_all:
+        sessions = list_all_sessions()
+        if not sessions:
+            return "No subagent sessions recorded across any workspace."
+        return _format_sessions_lines(
+            sessions,
+            "### All Subagent Sessions Across Workspaces:",
+            show_cwd=True,
+        )
+
+    sessions = get_sessions_data(real_cwd)
+    if not sessions:
+        return f"No subagent sessions recorded for workspace: {real_cwd}"
+    return _format_sessions_lines(
+        sessions,
+        f"### Subagent Sessions for `{real_cwd}`:",
+        show_cwd=False,
+    )
+
+
+def list_sessions(cwd: str, show_all: bool = False):
+    print(get_sessions_text(cwd, show_all=show_all))
 
 
 def clear_sessions(cwd: str) -> int:
-    """Remove all recorded numbered sessions for `cwd`, returning removed count."""
+    """Remove all recorded numbered sessions for target workspace `cwd`, returning removed count."""
     reg_path = get_registry_path(cwd)
     with _file_lock(reg_path + ".lock", exclusive=True):
         reg = _read_registry_unlocked(reg_path, cwd)
         count = len(reg.get("sessions", []))
         reg["sessions"] = []
+        _stamp_registry_meta(reg)
         _write_json_atomic(reg_path, reg)
         return count
 
 
 def delete_session(cwd: str, ref: str) -> bool:
-    """Delete a single numbered session (or UUID) from the registry for `cwd`."""
+    """Delete a single numbered session (or UUID) from the registry for target workspace `cwd`."""
     reg_path = get_registry_path(cwd)
     clean_ref = str(ref).lstrip("#").strip()
     with _file_lock(reg_path + ".lock", exclusive=True):
@@ -545,38 +684,202 @@ def delete_session(cwd: str, ref: str) -> bool:
                 kept.append(s)
         if removed:
             reg["sessions"] = kept
+            _stamp_registry_meta(reg)
             _write_json_atomic(reg_path, reg)
         return removed
 
 
-def resolve_session(cwd: str, ref: str) -> tuple:
-    """Resolve user reference (int, '#int', 'latest', or UUID) to (session_id, numeric_id, title)."""
+def resolve_session_entry(cwd: str, ref: str):
+    """Resolve user reference (int, '#int', 'latest', or UUID) to full session dict or None."""
     reg = load_registry(cwd)
     sessions = reg.get("sessions", [])
     if not sessions:
         if ref and len(str(ref)) > 20:
-            return ref, None, "External Session"
-        return None, None, None
+            return {"session_id": ref, "id": None, "title": "External Session"}
+        return None
 
     if ref in (None, "latest", "AUTO"):
-        last = sessions[-1]
-        return last["session_id"], last["id"], last.get("title", "")
+        return dict(sessions[-1])
 
     clean_ref = str(ref).lstrip("#").strip()
     if clean_ref.isdigit():
         num_id = int(clean_ref)
         for s in sessions:
             if s.get("id") == num_id:
-                return s["session_id"], s["id"], s.get("title", "")
+                return dict(s)
 
     for s in sessions:
         if s.get("session_id") == ref:
-            return s["session_id"], s["id"], s.get("title", "")
+            return dict(s)
 
     if len(str(ref)) > 20:
-        return ref, None, "Custom UUID"
+        return {"session_id": ref, "id": None, "title": "Custom UUID"}
 
-    return None, None, None
+    return None
+
+
+def resolve_session(cwd: str, ref: str) -> tuple:
+    """Resolve user reference (int, '#int', 'latest', or UUID) to (session_id, numeric_id, title)."""
+    entry = resolve_session_entry(cwd, ref)
+    if not entry:
+        return None, None, None
+    return entry["session_id"], entry.get("id"), entry.get("title", "")
+
+
+def register_running_session(
+    cwd: str,
+    session_id: str,
+    prompt: str,
+    model: str,
+    existing_id: int = None,
+    custom_title: str = None,
+    worktree_path: str = None,
+    pid: int = None,
+) -> tuple:
+    """Atomically pre-register or mark an active session as `running` before execution."""
+    if not session_id or session_id == "N/A":
+        return None, make_title(prompt, custom_title) if custom_title else "N/A"
+
+    reg_path = get_registry_path(cwd)
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    with _file_lock(reg_path + ".lock", exclusive=True):
+        reg = _read_registry_unlocked(reg_path, cwd)
+        sessions = reg.setdefault("sessions", [])
+
+        target = None
+        if existing_id is not None:
+            target = next((s for s in sessions if s.get("id") == existing_id), None)
+        if target is None:
+            target = next((s for s in sessions if s.get("session_id") == session_id), None)
+
+        if target is not None:
+            target["session_id"] = session_id
+            target["turns"] = target.get("turns", 1) + 1
+            target["updated_at"] = now_str
+            target["model"] = model
+            target["status"] = "running"
+            target["pid"] = pid
+            if custom_title and custom_title.strip():
+                target["title"] = make_title(prompt, custom_title)
+            if worktree_path:
+                target["worktree_path"] = worktree_path
+            _stamp_registry_meta(reg)
+            _write_json_atomic(reg_path, reg)
+            return target["id"], target.get("title", "")
+
+        max_id = max([s.get("id", 0) for s in sessions], default=0)
+        new_id = max_id + 1
+        title = make_title(prompt, custom_title)
+
+        new_entry = {
+            "id": new_id,
+            "session_id": session_id,
+            "title": title,
+            "created_at": now_str,
+            "updated_at": now_str,
+            "model": model,
+            "turns": 1,
+            "status": "running",
+            "pid": pid,
+        }
+        if worktree_path:
+            new_entry["worktree_path"] = worktree_path
+        sessions.append(new_entry)
+        _stamp_registry_meta(reg)
+        _write_json_atomic(reg_path, reg)
+        return new_id, title
+
+
+def update_session_pid(cwd: str, numeric_id: int, pid: int):
+    """Attach live subprocess PID to an active running session entry."""
+    if numeric_id is None or not pid:
+        return
+    reg_path = get_registry_path(cwd)
+    try:
+        with _file_lock(reg_path + ".lock", exclusive=True):
+            reg = _read_registry_unlocked(reg_path, cwd)
+            for s in reg.get("sessions", []):
+                if s.get("id") == numeric_id:
+                    s["pid"] = pid
+                    _write_json_atomic(reg_path, reg)
+                    return
+    except Exception:
+        pass
+
+
+def finalize_session(
+    cwd: str,
+    session_id: str,
+    prompt: str,
+    model: str,
+    status: str = "completed",
+    existing_id: int = None,
+    custom_title: str = None,
+    worktree_path: str = None,
+    last_activity: str = None,
+    turns_override: int = None,
+) -> tuple:
+    """Finalize a pre-registered (or unrecorded) session entry with final status and metadata."""
+    if not session_id or session_id == "N/A":
+        return None, make_title(prompt, custom_title) if custom_title else "N/A"
+
+    reg_path = get_registry_path(cwd)
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    with _file_lock(reg_path + ".lock", exclusive=True):
+        reg = _read_registry_unlocked(reg_path, cwd)
+        sessions = reg.setdefault("sessions", [])
+
+        target = None
+        if existing_id is not None:
+            target = next((s for s in sessions if s.get("id") == existing_id), None)
+        if target is None:
+            target = next((s for s in sessions if s.get("session_id") == session_id), None)
+
+        if target is not None:
+            target["session_id"] = session_id
+            target["updated_at"] = now_str
+            target["model"] = model
+            if target.get("status") == "stopped" and status in ("failed", "interrupted"):
+                target["status"] = "stopped"
+            else:
+                target["status"] = status
+            target["pid"] = None
+            if turns_override is not None:
+                target["turns"] = turns_override
+            if custom_title and custom_title.strip():
+                target["title"] = make_title(prompt, custom_title)
+            if worktree_path:
+                target["worktree_path"] = worktree_path
+            if last_activity:
+                target["last_activity"] = last_activity[:240]
+            _stamp_registry_meta(reg)
+            _write_json_atomic(reg_path, reg)
+            return target["id"], target.get("title", "")
+
+        max_id = max([s.get("id", 0) for s in sessions], default=0)
+        new_id = max_id + 1
+        title = make_title(prompt, custom_title)
+        new_entry = {
+            "id": new_id,
+            "session_id": session_id,
+            "title": title,
+            "created_at": now_str,
+            "updated_at": now_str,
+            "model": model,
+            "turns": turns_override if turns_override is not None else 1,
+            "status": status,
+            "pid": None,
+        }
+        if worktree_path:
+            new_entry["worktree_path"] = worktree_path
+        if last_activity:
+            new_entry["last_activity"] = last_activity[:240]
+        sessions.append(new_entry)
+        _stamp_registry_meta(reg)
+        _write_json_atomic(reg_path, reg)
+        return new_id, title
 
 
 def record_session(
@@ -606,10 +909,13 @@ def record_session(
                     s["turns"] = s.get("turns", 1) + 1
                     s["updated_at"] = now_str
                     s["model"] = model
+                    s["status"] = "completed"
+                    s["pid"] = None
                     if custom_title and custom_title.strip():
                         s["title"] = make_title(prompt, custom_title)
                     if worktree_path:
                         s["worktree_path"] = worktree_path
+                    _stamp_registry_meta(reg)
                     _write_json_atomic(reg_path, reg)
                     return s["id"], s.get("title", "")
 
@@ -618,10 +924,13 @@ def record_session(
                 s["turns"] = s.get("turns", 1) + 1
                 s["updated_at"] = now_str
                 s["model"] = model
+                s["status"] = "completed"
+                s["pid"] = None
                 if custom_title and custom_title.strip():
                     s["title"] = make_title(prompt, custom_title)
                 if worktree_path:
                     s["worktree_path"] = worktree_path
+                _stamp_registry_meta(reg)
                 _write_json_atomic(reg_path, reg)
                 return s["id"], s.get("title", "")
 
@@ -637,12 +946,49 @@ def record_session(
             "updated_at": now_str,
             "model": model,
             "turns": 1,
+            "status": "completed",
+            "pid": None,
         }
         if worktree_path:
             new_entry["worktree_path"] = worktree_path
         sessions.append(new_entry)
+        _stamp_registry_meta(reg)
         _write_json_atomic(reg_path, reg)
         return new_id, title
+
+
+def stop_session(cwd: str, ref: str) -> dict:
+    """Stop a running subagent session by terminating its process group, preserving session entry."""
+    entry = resolve_session_entry(cwd, ref)
+    if not entry or entry.get("id") is None:
+        return {"ok": False, "found": False, "error": f"Session '{ref}' not found in {os.path.realpath(cwd)}"}
+
+    reg_path = get_registry_path(cwd)
+    pid = entry.get("pid")
+    was_running = entry.get("status") == "running" and _is_pid_alive(pid)
+    if was_running:
+        _terminate_pid_group(pid, grace_sec=2.0)
+
+    with _file_lock(reg_path + ".lock", exclusive=True):
+        reg = _read_registry_unlocked(reg_path, cwd)
+        for s in reg.get("sessions", []):
+            if s.get("id") == entry.get("id"):
+                if was_running or s.get("status") == "running":
+                    s["status"] = "stopped"
+                    s["last_activity"] = "Stopped via `claude-subagent stop`"
+                s["pid"] = None
+                s["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                _stamp_registry_meta(reg)
+                _write_json_atomic(reg_path, reg)
+                return {
+                    "ok": True,
+                    "found": True,
+                    "id": s["id"],
+                    "wasRunning": was_running,
+                    "status": s["status"],
+                }
+
+    return {"ok": False, "found": False, "error": f"Session '{ref}' not found"}
 
 
 # ---------------------------------------------------------------------------
@@ -782,30 +1128,9 @@ def snapshot_git_state(target_dir: str):
 def get_git_changes(target_dir: str, base_head: str = None, pre_snapshot: dict = None):
     """Return compact diff summary (run-delta aware when pre_snapshot given) and per-file status list."""
     try:
-        unstaged = subprocess.run(
-            ["git", "diff", "--shortstat"],
-            cwd=target_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-        if unstaged.returncode != 0:
+        post_snap = snapshot_git_state(target_dir)
+        if post_snap is None:
             return "", []
-        staged = subprocess.run(
-            ["git", "diff", "--cached", "--shortstat"],
-            cwd=target_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-        _, u_add, u_del = _parse_shortstat(unstaged.stdout)
-        _, s_add, s_del = _parse_shortstat(staged.stdout)
-        added = u_add + s_add
-        deleted = u_del + s_del
-
-        post_snap = snapshot_git_state(target_dir) or {}
         file_items = [(sig[0], path) for path, sig in post_snap.items()]
 
         commit_note = ""
@@ -851,6 +1176,30 @@ def get_git_changes(target_dir: str, base_head: str = None, pre_snapshot: dict =
                 return "", []
             return "; ".join(parts), delta_items
 
+        added = 0
+        deleted = 0
+        if file_items:
+            unstaged = subprocess.run(
+                ["git", "diff", "--shortstat"],
+                cwd=target_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--shortstat"],
+                cwd=target_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            _, u_add, u_del = _parse_shortstat(unstaged.stdout)
+            _, s_add, s_del = _parse_shortstat(staged.stdout)
+            added = u_add + s_add
+            deleted = u_del + s_del
+
         parts = []
         if file_items:
             parts.append(f"{len(file_items)} working-tree file(s) changed, +{added}/-{deleted}")
@@ -866,22 +1215,76 @@ def get_git_changes(target_dir: str, base_head: str = None, pre_snapshot: dict =
 
 
 # ---------------------------------------------------------------------------
-# Telemetry and Output Parsing
+# Telemetry, Stream-JSON Parsing & Output Formatting
 # ---------------------------------------------------------------------------
 
-def clean_output(raw_text: str):
-    """Strip ANSI escapes and locate/parse the JSON payload in Claude output."""
-    cleaned = ANSI_ESCAPE.sub("", raw_text or "")
+def parse_stream_event(line: str):
+    """Parse a single NDJSON line from `claude --output-format stream-json`."""
+    stripped = ANSI_ESCAPE.sub("", line or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        obj = json.loads(stripped)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
 
-    for line in reversed(cleaned.splitlines()):
+
+def _extract_activity_from_assistant_message(msg: dict) -> tuple:
+    """Return (model_or_none, activity_or_none, text_or_none) from a Claude assistant message."""
+    if not isinstance(msg, dict):
+        return None, None, None
+    model = msg.get("model") or None
+    activity = None
+    last_text = None
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                tname = block.get("name", "tool")
+                tinp = block.get("input") or {}
+                hint = ""
+                for key in ("command", "file_path", "path", "pattern", "query"):
+                    if isinstance(tinp, dict) and tinp.get(key):
+                        hint = str(tinp[key]).splitlines()[0][:120]
+                        break
+                activity = f"Tool `{tname}`" + (f": {hint}" if hint else "")
+                break
+            if btype == "text" and block.get("text", "").strip():
+                txt_lines = [l.strip() for l in block["text"].splitlines() if l.strip()]
+                if txt_lines:
+                    last_text = block["text"].strip()
+                    activity = txt_lines[-1][:200]
+                break
+    return model, activity, last_text
+
+
+def clean_output(raw_text: str):
+    """Strip ANSI escapes and locate/parse the final result JSON payload (supports stream-json & json)."""
+    cleaned = ANSI_ESCAPE.sub("", raw_text or "")
+    parsed_dicts = []
+
+    for line in cleaned.splitlines():
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
             try:
                 obj = json.loads(line)
                 if isinstance(obj, dict):
-                    return obj
+                    parsed_dicts.append(obj)
             except json.JSONDecodeError:
                 continue
+
+    if parsed_dicts:
+        for obj in reversed(parsed_dicts):
+            if obj.get("type") == "result":
+                return obj
+        for obj in reversed(parsed_dicts):
+            if "result" in obj or "session_id" in obj:
+                return obj
+        return parsed_dicts[-1]
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
@@ -943,30 +1346,11 @@ def recover_session_telemetry(cwd: str, session_uuid: str, claude_projects_dir: 
                         model = list(mu.keys())[0]
                 elif etype == "assistant":
                     num_turns += 1
-                    msg = entry.get("message")
-                    if isinstance(msg, dict):
-                        if msg.get("model"):
-                            model = msg.get("model")
-                        content = msg.get("content")
-                        if isinstance(content, list):
-                            for block in reversed(content):
-                                if not isinstance(block, dict):
-                                    continue
-                                btype = block.get("type")
-                                if btype == "tool_use":
-                                    tname = block.get("name", "tool")
-                                    tinp = block.get("input") or {}
-                                    hint = ""
-                                    for key in ("command", "file_path", "path", "pattern"):
-                                        if isinstance(tinp, dict) and tinp.get(key):
-                                            hint = str(tinp[key]).splitlines()[0][:120]
-                                            break
-                                    last_activity = f"Tool `{tname}`" + (f": {hint}" if hint else "")
-                                    break
-                                if btype == "text" and block.get("text", "").strip():
-                                    txt_line = [l.strip() for l in block["text"].splitlines() if l.strip()][-1]
-                                    last_activity = txt_line[:200]
-                                    break
+                    msg_model, msg_act, _ = _extract_activity_from_assistant_message(entry.get("message"))
+                    if msg_model:
+                        model = msg_model
+                    if msg_act:
+                        last_activity = msg_act
     except Exception:
         return {"exists": True, "transcript_path": transcript_path}
 
@@ -990,6 +1374,17 @@ def extract_actual_model(payload: dict, fallback_model: str) -> str:
     return fallback_model or "default"
 
 
+def is_free_or_local_model(actual_model: str = None, provider: str = None) -> bool:
+    model_l = (actual_model or "").lower()
+    prov_l = (provider or "").lower()
+    return (
+        model_l.endswith(":free")
+        or prov_l in ("ollama", "lmstudio", "local")
+        or "ollama" in model_l
+        or "-dflash" in model_l
+    )
+
+
 def format_metrics(
     payload: dict,
     elapsed_sec: float,
@@ -1011,14 +1406,7 @@ def format_metrics(
     if isinstance(num_turns, int) and num_turns > 0:
         parts.append(f"{num_turns} turn{'s' if num_turns != 1 else ''}")
 
-    model_l = (actual_model or "").lower()
-    prov_l = (provider or "").lower()
-    is_free_or_local = (
-        model_l.endswith(":free")
-        or prov_l in ("ollama", "lmstudio", "local")
-        or "ollama" in model_l
-        or "-dflash" in model_l
-    )
+    is_free_or_local = is_free_or_local_model(actual_model=actual_model, provider=provider)
     cost = payload.get("total_cost_usd") if isinstance(payload, dict) else None
     if is_free_or_local:
         parts.append("free")
@@ -1069,6 +1457,21 @@ def format_delivery_report(
     return joined
 
 
+def _signal_pid_group(pid: int, sig: int):
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
+    try:
+        os.kill(pid, sig)
+    except Exception:
+        pass
+
+
 def _signal_process_group(proc: subprocess.Popen, sig: int):
     if hasattr(os, "killpg"):
         try:
@@ -1087,8 +1490,62 @@ def _signal_process_group(proc: subprocess.Popen, sig: int):
         pass
 
 
-def run_subprocess_safely(cmd, cwd, timeout=None):
-    """Launch cmd in its own process group; strip TMUX so tmux hooks never fire for headless runs."""
+def _pgid_alive(pgid: int) -> bool:
+    if not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_pid_group(pid: int, grace_sec: float = 2.0):
+    """Best-effort SIGINT -> SIGTERM -> SIGKILL teardown for an externally stopped session PID."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        _signal_pid_group(pid, sig)
+        deadline = time.monotonic() + grace_sec
+        while time.monotonic() < deadline:
+            if not _pgid_alive(pid) and not _is_pid_alive(pid):
+                return
+            time.sleep(0.05)
+
+
+def _terminate_process_group(proc: subprocess.Popen, threads: list, grace_sec: float = 3.0):
+    """Escalate SIGINT -> SIGTERM -> SIGKILL across the full process group until all members exit."""
+    pgid = proc.pid
+    for sig, wait_sec in ((signal.SIGINT, grace_sec), (signal.SIGTERM, grace_sec), (signal.SIGKILL, None)):
+        _signal_process_group(proc, sig)
+        if wait_sec is None:
+            try:
+                proc.wait()
+            except Exception:
+                pass
+            for t in threads:
+                t.join(timeout=2)
+            return
+
+        deadline = time.monotonic() + wait_sec
+        try:
+            proc.wait(timeout=wait_sec)
+        except subprocess.TimeoutExpired:
+            continue
+
+        while time.monotonic() < deadline:
+            for t in threads:
+                t.join(timeout=0.05)
+            pipes_closed = not any(t.is_alive() for t in threads)
+            if pipes_closed and not _pgid_alive(pgid):
+                return
+            time.sleep(0.05)
+
+
+def run_subprocess_streaming(cmd, cwd, timeout=None, on_line=None, on_start=None):
+    """Launch cmd in its own process group, streaming stdout lines while avoiding pipe deadlocks."""
     env = os.environ.copy()
     env.pop("TMUX", None)
     env.pop("TMUX_PANE", None)
@@ -1098,39 +1555,81 @@ def run_subprocess_safely(cmd, cwd, timeout=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
         env=env,
     )
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
+
     proc = subprocess.Popen(cmd, **popen_kwargs)
-    try:
-        stdout, stderr = proc.communicate(timeout=effective_timeout)
-        return proc.returncode, stdout, stderr
-    except subprocess.TimeoutExpired:
-        _signal_process_group(proc, signal.SIGINT)
+    if on_start is not None:
         try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(proc, signal.SIGTERM)
+            on_start(proc.pid)
+        except Exception:
+            pass
+
+    stdout_chunks = []
+    stderr_chunks = []
+
+    def _read_stdout():
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                stdout_chunks.append(line)
+                if on_line is not None:
+                    try:
+                        on_line(line)
+                    except Exception:
+                        pass
+        finally:
             try:
-                stdout, stderr = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                _signal_process_group(proc, signal.SIGKILL)
-                stdout, stderr = proc.communicate()
-        timeout_note = f"\n[claude-subagent] Timed out after {timeout}s; terminated subprocess group."
-        return -1, stdout, (stderr or "") + timeout_note
-    except KeyboardInterrupt:
-        _signal_process_group(proc, signal.SIGINT)
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    def _read_stderr():
         try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(proc, signal.SIGKILL)
-            stdout, stderr = proc.communicate()
+            for line in iter(proc.stderr.readline, ""):
+                stderr_chunks.append(line)
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+    threads = [t_out, t_err]
+
+    timed_out = False
+    try:
+        proc.wait(timeout=effective_timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(proc, threads, grace_sec=3.0)
+    except KeyboardInterrupt:
+        _terminate_process_group(proc, threads, grace_sec=2.0)
         raise
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    stdout_text = "".join(stdout_chunks)
+    stderr_text = "".join(stderr_chunks)
+    if timed_out:
+        timeout_note = f"\n[claude-subagent] Timed out after {timeout}s; terminated subprocess group."
+        return -1, stdout_text, stderr_text + timeout_note
+    return proc.returncode, stdout_text, stderr_text
+
+
+def run_subprocess_safely(cmd, cwd, timeout=None):
+    """Launch cmd in its own process group; strip TMUX so tmux hooks never fire for headless runs."""
+    return run_subprocess_streaming(cmd, cwd, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
-# Command Construction (Testable Pure Helper)
+# Command Construction & Role/Prompt Helpers
 # ---------------------------------------------------------------------------
 
 def resolve_prompt_input(prompt: str) -> str:
@@ -1145,6 +1644,45 @@ def resolve_prompt_input(prompt: str) -> str:
         except OSError:
             pass
     return prompt
+
+
+def resolve_json_schema_input(schema: str) -> str:
+    """Resolve inline JSON schema string or a path to a JSON schema file."""
+    if not schema:
+        return schema
+    if "\n" not in schema and len(schema) < 512:
+        try:
+            if os.path.isfile(schema):
+                with open(schema, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+        except OSError:
+            pass
+    return schema
+
+
+def _resolve_role_defaults(role: str = None, agent: str = None, allowed_tools: str = None, readonly: bool = False) -> tuple:
+    """Resolve `--readonly` and `--role research|review|implement` into (agent, allowed_tools)."""
+    eff_agent = agent
+    eff_tools = allowed_tools
+    if readonly and not eff_tools:
+        eff_tools = "readonly"
+
+    if role:
+        norm_role = role.strip().lower()
+        role_map = {
+            "research": ("workflow-researcher", "readonly"),
+            "review": ("workflow-reviewer", "readonly"),
+            "implement": ("workflow-implementer", None),
+        }
+        if norm_role in role_map:
+            agent_name, fallback_tools = role_map[norm_role]
+            agent_file = os.path.expanduser(f"~/.claude/agents/{agent_name}.md")
+            if not eff_agent and os.path.isfile(agent_file):
+                eff_agent = agent_name
+            elif not eff_tools and fallback_tools:
+                eff_tools = fallback_tools
+
+    return eff_agent, eff_tools
 
 
 def build_command(
@@ -1169,6 +1707,14 @@ def build_command(
     permission_mode: str = "bypassPermissions",
     crouter_path: str = None,
     claude_path: str = None,
+    output_format: str = "stream-json",
+    chrome: bool = False,
+    mcp_configs: list = None,
+    fork_session: bool = False,
+    fallback_model: str = None,
+    json_schema: str = None,
+    no_session_persistence: bool = False,
+    extra_claude_args: list = None,
 ) -> list:
     """Build exact crouter/claude command line without mutating saved crouter defaults."""
     resolved_crouter = find_crouter() if crouter_path is None else crouter_path
@@ -1182,16 +1728,24 @@ def build_command(
         "-p",
         prompt,
         "--output-format",
-        "json",
-        "--permission-mode",
-        permission_mode or "bypassPermissions",
+        output_format or "stream-json",
     ]
+    if (output_format or "stream-json") == "stream-json":
+        claude_args.append("--verbose")
+
+    claude_args.extend(["--permission-mode", permission_mode or "bypassPermissions"])
+    claude_args.append("--chrome" if chrome else "--no-chrome")
 
     if bare:
         claude_args.append("--bare")
 
     if strict_mcp:
         claude_args.append("--strict-mcp-config")
+
+    if mcp_configs:
+        for cfg in mcp_configs:
+            if cfg and str(cfg).strip():
+                claude_args.extend(["--mcp-config", str(cfg).strip()])
 
     if allowed_tools:
         resolved_tools = TOOL_PRESETS.get(allowed_tools.strip().lower(), allowed_tools.strip())
@@ -1217,11 +1771,24 @@ def build_command(
     if append_system_prompt:
         claude_args.extend(["--append-system-prompt", append_system_prompt])
 
+    if fallback_model and str(fallback_model).strip():
+        claude_args.extend(["--fallback-model", str(fallback_model).strip()])
+
+    if json_schema and str(json_schema).strip():
+        claude_args.extend(["--json-schema", str(json_schema).strip()])
+
+    if no_session_persistence:
+        claude_args.append("--no-session-persistence")
+
     if resume_uuid:
         claude_args.extend(["--resume", resume_uuid])
+        if fork_session:
+            claude_args.append("--fork-session")
     elif continue_session:
         claude_args.append("--continue")
-    elif session_id:
+        if fork_session:
+            claude_args.append("--fork-session")
+    elif session_id and not no_session_persistence:
         claude_args.extend(["--session-id", session_id])
 
     if str(worktree).lower() in ("true", "1") or worktree is True:
@@ -1231,6 +1798,9 @@ def build_command(
 
     if budget is not None and str(budget).strip():
         claude_args.extend(["--max-budget-usd", str(budget).strip()])
+
+    if extra_claude_args:
+        claude_args.extend(extra_claude_args)
 
     want_native = norm_backend == "native" or norm_provider == "claude"
     use_crouter = crouter_usable and not want_native
@@ -1272,6 +1842,16 @@ def build_command(
 # Core Subagent Execution
 # ---------------------------------------------------------------------------
 
+def _emit_stderr(msg: str, quiet: bool = False):
+    if quiet:
+        return
+    try:
+        sys.stderr.write(msg.rstrip() + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def execute_subagent(
     prompt: str,
     cwd: str = None,
@@ -1284,9 +1864,14 @@ def execute_subagent(
     timeout: int = None,
     bare: bool = False,
     strict_mcp: bool = False,
+    with_mcp: bool = False,
+    mcp_configs: list = None,
+    chrome: bool = False,
     allowed_tools: str = None,
     disallowed_tools: str = None,
     agent: str = None,
+    role: str = None,
+    readonly: bool = False,
     effort: str = None,
     title: str = None,
     add_dirs: list = None,
@@ -1295,16 +1880,33 @@ def execute_subagent(
     allow_unconfigured: bool = False,
     max_output_chars: int = None,
     raw_json: bool = False,
+    json_output: bool = False,
     dry_run: bool = False,
+    quiet: bool = False,
+    fork_session: bool = False,
+    fallback_model: str = None,
+    json_schema: str = None,
+    ephemeral: bool = False,
+    extra_claude_args: list = None,
 ) -> tuple:
     """Execute Claude subagent and return (exit_code: int, output_text: str)."""
-    target_cwd = os.path.abspath(cwd or os.getcwd())
+    target_cwd = os.path.realpath(cwd or os.getcwd())
     if not os.path.isdir(target_cwd):
-        return 1, f"Error: Target directory does not exist or is not a directory: {target_cwd}"
+        msg = f"Error: Target directory does not exist or is not a directory: {target_cwd}"
+        if json_output:
+            return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": msg}, indent=2, ensure_ascii=False)
+        return 1, msg
 
     prompt = resolve_prompt_input(prompt)
     if not prompt or not prompt.strip():
-        return 1, "Error: Prompt is empty."
+        msg = "Error: Prompt is empty."
+        if json_output:
+            return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": msg}, indent=2, ensure_ascii=False)
+        return 1, msg
+
+    eff_agent, eff_allowed_tools = _resolve_role_defaults(
+        role=role, agent=agent, allowed_tools=allowed_tools, readonly=readonly
+    )
 
     config = load_config()
     try:
@@ -1312,32 +1914,76 @@ def execute_subagent(
             config=config,
             cli_provider=provider,
             cli_model=model,
-            agent=agent,
+            agent=eff_agent,
             allow_unconfigured=allow_unconfigured,
         )
     except RuntimeError as e:
         if str(e) == "SETUP_REQUIRED":
-            return EXIT_SETUP_REQUIRED, format_setup_required_message(discover_environment())
+            env_info = discover_environment()
+            if json_output:
+                return EXIT_SETUP_REQUIRED, json.dumps(
+                    {
+                        "ok": False,
+                        "status": "setup_required",
+                        "exitCode": EXIT_SETUP_REQUIRED,
+                        "discovery": env_info,
+                        "error": "SETUP_REQUIRED: Run `claude-subagent setup --discover` and persist a default route.",
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            return EXIT_SETUP_REQUIRED, format_setup_required_message(env_info)
         return 1, f"Error: {e}"
     except ValueError as e:
+        if json_output:
+            return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": str(e)}, indent=2, ensure_ascii=False)
         return 1, f"Error: {e}"
 
     eff_permission_mode = permission_mode or cfg_perm or "bypassPermissions"
+    policies = (config or {}).get("policies") or {}
+
+    if with_mcp:
+        eff_strict_mcp = False
+    elif strict_mcp:
+        eff_strict_mcp = True
+    elif mcp_configs:
+        eff_strict_mcp = True
+    else:
+        eff_strict_mcp = bool(policies.get("strictMcp", True))
+
+    resolved_schema = resolve_json_schema_input(json_schema) if json_schema else None
 
     target_session_uuid = None
     target_numeric_id = None
     target_title = None
+    prior_worktree_path = None
 
     if resume:
-        target_session_uuid, target_numeric_id, target_title = resolve_session(target_cwd, resume)
-        if not target_session_uuid:
+        entry = resolve_session_entry(target_cwd, resume)
+        if not entry:
             sessions_hint = get_sessions_text(target_cwd)
-            return 1, f"Error: Could not find session '{resume}' in {target_cwd}.\n\n{sessions_hint}"
+            err = f"Error: Could not find session '{resume}' in {target_cwd}.\n\n{sessions_hint}"
+            if json_output:
+                return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": err}, indent=2, ensure_ascii=False)
+            return 1, err
+        target_session_uuid = entry["session_id"]
+        target_numeric_id = entry.get("id")
+        target_title = entry.get("title")
+        prior_worktree_path = entry.get("worktree_path")
     elif continue_session:
-        target_session_uuid, target_numeric_id, target_title = resolve_session(target_cwd, "latest")
+        entry = resolve_session_entry(target_cwd, "latest")
+        if entry:
+            target_session_uuid = entry["session_id"]
+            target_numeric_id = entry.get("id")
+            target_title = entry.get("title")
+            prior_worktree_path = entry.get("worktree_path")
 
-    # Pre-assign a deterministic UUID for new sessions so interrupted/timed-out runs stay resumable
-    pre_session_uuid = None if (target_session_uuid or continue_session) else str(uuid.uuid4())
+    if fork_session:
+        target_numeric_id = None
+
+    is_new_session = not (target_session_uuid or continue_session)
+    pre_session_uuid = None if (not is_new_session or ephemeral) else str(uuid.uuid4())
+    output_format = "json" if raw_json else "stream-json"
 
     try:
         cmd = build_command(
@@ -1351,17 +1997,27 @@ def execute_subagent(
             worktree=worktree,
             budget=budget,
             bare=bare,
-            strict_mcp=strict_mcp,
-            allowed_tools=allowed_tools,
+            strict_mcp=eff_strict_mcp,
+            allowed_tools=eff_allowed_tools,
             disallowed_tools=disallowed_tools,
-            agent=agent,
+            agent=eff_agent,
             effort=effort,
             title=title,
             add_dirs=add_dirs,
             append_system_prompt=append_system_prompt,
             permission_mode=eff_permission_mode,
+            output_format=output_format,
+            chrome=chrome,
+            mcp_configs=mcp_configs,
+            fork_session=fork_session,
+            fallback_model=fallback_model,
+            json_schema=resolved_schema,
+            no_session_persistence=ephemeral,
+            extra_claude_args=extra_claude_args,
         )
     except ValueError as e:
+        if json_output:
+            return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": str(e)}, indent=2, ensure_ascii=False)
         return 1, f"Error: {e}"
 
     if dry_run:
@@ -1372,7 +2028,13 @@ def execute_subagent(
                 "backend": eff_backend,
                 "provider": eff_provider,
                 "model": eff_model,
+                "agent": eff_agent,
+                "allowedTools": eff_allowed_tools,
                 "permissionMode": eff_permission_mode,
+                "strictMcp": eff_strict_mcp,
+                "chrome": chrome,
+                "ephemeral": ephemeral,
+                "forkSession": fork_session,
                 "sessionId": target_session_uuid or pre_session_uuid,
                 "command": cmd,
                 "shell": " ".join(shlex.quote(x) for x in cmd),
@@ -1381,114 +2043,319 @@ def execute_subagent(
             ensure_ascii=False,
         )
 
-    pre_worktrees = list_git_worktrees(target_cwd) if worktree else []
     base_head = get_git_head(target_cwd)
-    pre_git_snap = None if worktree else snapshot_git_state(target_cwd)
+    is_git_repo = base_head is not None
+    pre_worktrees = list_git_worktrees(target_cwd) if (is_git_repo and worktree) else []
+    active_prior_wt = prior_worktree_path if (prior_worktree_path and os.path.isdir(prior_worktree_path)) else None
+    git_snap_dir = active_prior_wt or target_cwd
+    wt_base_head = get_git_head(active_prior_wt) if active_prior_wt else base_head
+    pre_git_snap = None if (not is_git_repo or worktree) else snapshot_git_state(git_snap_dir)
 
+    cfg_default_model = (config or {}).get("defaultRoute", {}).get("model") if not model else None
+    initial_model_label = eff_model or cfg_default_model or eff_provider or "default"
+
+    pre_reg_id = None
+    pre_reg_title = make_title(prompt, title) if (title or not target_title) else target_title
+    provisional_uuid = pre_session_uuid or target_session_uuid
+
+    if not ephemeral and provisional_uuid and not fork_session:
+        pre_reg_id, pre_reg_title = register_running_session(
+            target_cwd,
+            provisional_uuid,
+            prompt,
+            initial_model_label,
+            existing_id=target_numeric_id,
+            custom_title=title,
+            worktree_path=active_prior_wt,
+        )
+
+    live_state = {
+        "session_id": provisional_uuid,
+        "model": None,
+        "turns": 0,
+        "last_activity": None,
+        "last_text": None,
+        "last_reported_activity": None,
+    }
     started_at = time.monotonic()
+
+    sess_tag = f"#{pre_reg_id}" if pre_reg_id else ("fork" if fork_session else "ephemeral")
+    route_desc = f"{eff_provider or eff_backend}/{initial_model_label}"
+    _emit_stderr(
+        f"[claude-subagent] Session {sess_tag} (\"{pre_reg_title}\") started | route={route_desc} | cwd={target_cwd}",
+        quiet=quiet,
+    )
+
+    def _on_stream_line(line: str):
+        ev = parse_stream_event(line)
+        if not ev:
+            return
+        if ev.get("session_id") and not live_state["session_id"]:
+            live_state["session_id"] = ev.get("session_id")
+        etype = ev.get("type")
+        if etype == "system" and ev.get("subtype") == "init":
+            if ev.get("model"):
+                live_state["model"] = ev.get("model")
+        elif etype == "assistant":
+            live_state["turns"] += 1
+            msg_model, msg_act, msg_txt = _extract_activity_from_assistant_message(ev.get("message"))
+            if msg_model:
+                live_state["model"] = msg_model
+            if msg_txt:
+                live_state["last_text"] = msg_txt
+            if msg_act:
+                live_state["last_activity"] = msg_act
+                if msg_act != live_state["last_reported_activity"]:
+                    live_state["last_reported_activity"] = msg_act
+                    dt = time.monotonic() - started_at
+                    _emit_stderr(
+                        f"[claude-subagent {sess_tag} +{dt:.1f}s · turn {live_state['turns']}] {msg_act}",
+                        quiet=quiet,
+                    )
+        elif etype == "result":
+            if ev.get("session_id"):
+                live_state["session_id"] = ev.get("session_id")
+
+    def _on_start(pid: int):
+        if pre_reg_id is not None:
+            update_session_pid(target_cwd, pre_reg_id, pid)
+
+    finalized = False
     try:
-        returncode, stdout, stderr = run_subprocess_safely(cmd, target_cwd, timeout)
-    except FileNotFoundError as e:
-        return 1, f"Error launching Claude subagent: {e}"
-    elapsed_sec = time.monotonic() - started_at
-
-    payload = clean_output(stdout)
-
-    worktree_path, worktree_branch = detect_worktree_info(target_cwd, worktree, pre_worktrees, payload)
-    git_inspect_dir = worktree_path or target_cwd
-    git_summary, git_files = get_git_changes(
-        git_inspect_dir,
-        base_head=base_head,
-        pre_snapshot=None if worktree_path else pre_git_snap,
-    )
-
-    if raw_json:
-        if payload:
-            return (0 if returncode == 0 else 1), json.dumps(payload, indent=2, ensure_ascii=False)
-        return (0 if returncode == 0 else 1), stdout
-
-    success = returncode == 0 and payload is not None and not payload.get("is_error")
-    status_label = "SUCCESS" if success else "FAILED"
-
-    candidate_uuid = (payload.get("session_id") if payload else None) or target_session_uuid or pre_session_uuid
-    recovered = {}
-    if payload is None and candidate_uuid:
-        recovered = recover_session_telemetry(git_inspect_dir, candidate_uuid)
-        if not recovered and git_inspect_dir != target_cwd:
-            recovered = recover_session_telemetry(target_cwd, candidate_uuid)
-
-    cfg_default_model = ((config or {}).get("defaultRoute") or {}).get("model") if not model else None
-    model_fallback = recovered.get("model") or eff_model or cfg_default_model or eff_provider or "default"
-    actual_model = extract_actual_model(payload, model_fallback)
-    result_text = payload.get("result", "") if payload else (stdout.strip() or stderr.strip())
-
-    should_record = bool(
-        (payload and payload.get("session_id"))
-        or target_session_uuid
-        or recovered.get("exists")
-    )
-    session_uuid = candidate_uuid if should_record else None
-    numeric_id, resolved_title = record_session(
-        target_cwd,
-        session_uuid,
-        prompt,
-        actual_model,
-        existing_id=target_numeric_id,
-        custom_title=title,
-        worktree_path=worktree_path,
-    )
-
-    lines = []
-    display_title = resolved_title or target_title or ""
-    session_label = f"#{numeric_id} (\"{display_title}\")" if numeric_id else (f"\"{display_title}\"" if display_title else "")
-    session_str = f" Session {session_label} |" if session_label else ""
-    metrics_str = format_metrics(
-        payload,
-        elapsed_sec,
-        actual_model=actual_model,
-        provider=eff_provider,
-        recovered_turns=recovered.get("num_turns"),
-    )
-    metrics_suffix = f" | {metrics_str}" if metrics_str else ""
-    lines.append(f"### [Claude Subagent: {status_label}]{session_str} Model: `{actual_model}`{metrics_suffix}")
-
-    if worktree_path:
-        branch_part = f" (branch: `{worktree_branch}`)" if worktree_branch else ""
-        lines.append(f"**Worktree:** `{worktree_path}`{branch_part}")
-
-    if git_summary:
-        lines.append(f"**Git Changes:** {git_summary}")
-        if git_files:
-            for status_code, path in git_files[:15]:
-                lines.append(f"  * `{status_code}` {path}")
-            if len(git_files) > 15:
-                lines.append(f"  * ... and {len(git_files) - 15} more files")
-        lines.append("")
-
-    if not success:
-        if recovered.get("last_activity"):
-            lines.append(f"**Last Activity Before Interruption:** {recovered['last_activity']}")
-        if numeric_id:
-            lines.append(
-                f"**Resume:** `claude-subagent --cwd {shlex.quote(target_cwd)} -r {numeric_id} -p \"Continue from where you stopped.\"`"
+        try:
+            returncode, stdout, stderr = run_subprocess_streaming(
+                cmd,
+                target_cwd,
+                timeout=timeout,
+                on_line=_on_stream_line if output_format == "stream-json" else None,
+                on_start=_on_start,
             )
-        lines.append("**Error (Actionable Details):**")
+        except FileNotFoundError as e:
+            if pre_reg_id is not None and provisional_uuid:
+                finalize_session(
+                    target_cwd,
+                    provisional_uuid,
+                    prompt,
+                    initial_model_label,
+                    status="failed",
+                    existing_id=pre_reg_id,
+                    custom_title=title,
+                    worktree_path=active_prior_wt,
+                    last_activity=f"Launch error: {e}",
+                )
+                finalized = True
+            err = f"Error launching Claude subagent: {e}"
+            if json_output:
+                return 1, json.dumps({"ok": False, "status": "error", "exitCode": 1, "error": err}, indent=2, ensure_ascii=False)
+            return 1, err
+        elapsed_sec = time.monotonic() - started_at
+
+        payload = clean_output(stdout)
+
+        new_wt_path, new_wt_branch = detect_worktree_info(target_cwd, worktree, pre_worktrees, payload) if is_git_repo else (None, None)
+        worktree_path = new_wt_path or active_prior_wt
+        worktree_branch = new_wt_branch
+        if worktree_path and not worktree_branch and is_git_repo:
+            wt_entries = list_git_worktrees(target_cwd)
+            real_wt = os.path.realpath(worktree_path)
+            worktree_branch = next(
+                (w.get("branch") for w in wt_entries if os.path.realpath(w["path"]) == real_wt),
+                None,
+            )
+
+        git_inspect_dir = worktree_path or target_cwd
+        if is_git_repo:
+            git_summary, git_files = get_git_changes(
+                git_inspect_dir,
+                base_head=wt_base_head if (active_prior_wt and not new_wt_path) else base_head,
+                pre_snapshot=None if new_wt_path else pre_git_snap,
+            )
+        else:
+            git_summary, git_files = "", []
+
+        success = returncode == 0 and payload is not None and not payload.get("is_error")
+        status_label = "SUCCESS" if success else "FAILED"
+        final_status = "completed" if success else ("interrupted" if returncode == -1 else "failed")
+
+        candidate_uuid = (
+            (payload.get("session_id") if payload else None)
+            or live_state.get("session_id")
+            or target_session_uuid
+            or pre_session_uuid
+        )
+        recovered = {}
+        if payload is None and candidate_uuid:
+            recovered = recover_session_telemetry(git_inspect_dir, candidate_uuid)
+            if not recovered and git_inspect_dir != target_cwd:
+                recovered = recover_session_telemetry(target_cwd, candidate_uuid)
+
+        model_fallback = (
+            live_state.get("model")
+            or recovered.get("model")
+            or eff_model
+            or cfg_default_model
+            or eff_provider
+            or "default"
+        )
+        actual_model = extract_actual_model(payload, model_fallback)
+        last_activity = live_state.get("last_activity") or recovered.get("last_activity")
+        effective_turns = live_state.get("turns") or recovered.get("num_turns")
+
+        if payload:
+            result_text = payload.get("result", "")
+            if not result_text and live_state.get("last_text"):
+                result_text = live_state["last_text"]
+        else:
+            result_text = live_state.get("last_text") or stdout.strip() or stderr.strip()
+
+        should_record = not ephemeral and bool(
+            (payload and payload.get("session_id"))
+            or live_state.get("session_id")
+            or target_session_uuid
+            or recovered.get("exists")
+            or pre_reg_id is not None
+        )
+        session_uuid = candidate_uuid if should_record else None
+        if should_record and session_uuid:
+            numeric_id, resolved_title = finalize_session(
+                target_cwd,
+                session_uuid,
+                prompt,
+                actual_model,
+                status=final_status,
+                existing_id=pre_reg_id if pre_reg_id is not None else target_numeric_id,
+                custom_title=title,
+                worktree_path=worktree_path,
+                last_activity=last_activity,
+            )
+            finalized = True
+            persisted = resolve_session_entry(target_cwd, str(numeric_id))
+            if persisted and persisted.get("status") == "stopped":
+                final_status = "stopped"
+        else:
+            numeric_id, resolved_title = None, make_title(prompt, title) if title else (target_title or "Ephemeral")
+
+        _emit_stderr(
+            f"[claude-subagent] Session {f'#{numeric_id}' if numeric_id else 'ephemeral'} finished: "
+            f"{final_status} ({elapsed_sec:.1f}s)",
+            quiet=quiet,
+        )
+
+        if raw_json:
+            if payload:
+                return (0 if returncode == 0 else 1), json.dumps(payload, indent=2, ensure_ascii=False)
+            return (0 if returncode == 0 else 1), stdout
+
         if payload and payload.get("is_error") and payload.get("result"):
             error_blob = str(payload.get("result"))
             if stderr and stderr.strip():
                 error_blob += "\n" + stderr.strip()
         else:
             error_blob = stderr or stdout
-        lines.append(truncate_error(error_blob))
-    else:
-        lines.append("**Subagent Delivery & Review Report:**")
-        lines.append(format_delivery_report(result_text, max_chars=max_output_chars))
 
-    return (0 if success else 1), "\n".join(lines)
+        if json_output:
+            duration_ms = payload.get("duration_ms") if isinstance(payload, dict) else None
+            num_turns = (payload.get("num_turns") if isinstance(payload, dict) else None) or effective_turns
+            cost = payload.get("total_cost_usd") if isinstance(payload, dict) else None
+            envelope = {
+                "ok": success,
+                "status": "success" if success else final_status,
+                "exitCode": 0 if success else 1,
+                "session": {
+                    "id": numeric_id,
+                    "uuid": session_uuid,
+                    "title": resolved_title or target_title or "",
+                    "cwd": target_cwd,
+                    "worktreePath": worktree_path,
+                    "worktreeBranch": worktree_branch,
+                },
+                "route": {
+                    "source": route_source,
+                    "backend": eff_backend,
+                    "provider": eff_provider,
+                    "model": actual_model,
+                    "strictMcp": eff_strict_mcp,
+                    "chrome": chrome,
+                },
+                "metrics": {
+                    "elapsedSec": round(elapsed_sec, 2),
+                    "durationMs": duration_ms,
+                    "turns": num_turns,
+                    "costUsd": None if is_free_or_local_model(actual_model, eff_provider) else cost,
+                    "isFreeOrLocal": is_free_or_local_model(actual_model, eff_provider),
+                },
+                "git": {
+                    "summary": git_summary,
+                    "files": [{"status": sc, "path": p} for sc, p in git_files],
+                },
+                "report": format_delivery_report(result_text, max_chars=max_output_chars) if success else "",
+                "lastActivity": last_activity,
+                "error": None if success else truncate_error(error_blob),
+            }
+            return (0 if success else 1), json.dumps(envelope, indent=2, ensure_ascii=False)
+
+        lines = []
+        display_title = resolved_title or target_title or ""
+        session_label = f"#{numeric_id} (\"{display_title}\")" if numeric_id else (f"\"{display_title}\"" if display_title else "")
+        session_str = f" Session {session_label} |" if session_label else ""
+        metrics_str = format_metrics(
+            payload,
+            elapsed_sec,
+            actual_model=actual_model,
+            provider=eff_provider,
+            recovered_turns=effective_turns,
+        )
+        metrics_suffix = f" | {metrics_str}" if metrics_str else ""
+        lines.append(f"### [Claude Subagent: {status_label}]{session_str} Model: `{actual_model}`{metrics_suffix}")
+
+        if worktree_path:
+            branch_part = f" (branch: `{worktree_branch}`)" if worktree_branch else ""
+            lines.append(f"**Worktree:** `{worktree_path}`{branch_part}")
+
+        if git_summary:
+            lines.append(f"**Git Changes:** {git_summary}")
+            if git_files:
+                for status_code, path in git_files[:15]:
+                    lines.append(f"  * `{status_code}` {path}")
+                if len(git_files) > 15:
+                    lines.append(f"  * ... and {len(git_files) - 15} more files")
+            lines.append("")
+
+        if not success:
+            if last_activity:
+                lines.append(f"**Last Activity Before Interruption:** {last_activity}")
+            if numeric_id:
+                cwd_hint = f"-C {shlex.quote(target_cwd)} " if target_cwd != os.path.realpath(os.getcwd()) else ""
+                lines.append(
+                    f"**Resume:** `claude-subagent send {numeric_id} {cwd_hint}\"Continue from where you stopped.\"`"
+                )
+            lines.append("**Error (Actionable Details):**")
+            lines.append(truncate_error(error_blob))
+        else:
+            lines.append("**Subagent Delivery & Review Report:**")
+            lines.append(format_delivery_report(result_text, max_chars=max_output_chars))
+
+        return (0 if success else 1), "\n".join(lines)
+    finally:
+        if not finalized and pre_reg_id is not None and provisional_uuid:
+            try:
+                finalize_session(
+                    target_cwd,
+                    provisional_uuid,
+                    prompt,
+                    live_state.get("model") or initial_model_label,
+                    status="interrupted",
+                    existing_id=pre_reg_id,
+                    custom_title=title,
+                    worktree_path=active_prior_wt,
+                    last_activity=live_state.get("last_activity"),
+                )
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Setup & Config Subcommand Handlers
+# Setup, Config, Models, Doctor, Sessions & Native-Verb Handlers
 # ---------------------------------------------------------------------------
 
 def _parse_scenario_args(items: list, existing: dict = None) -> dict:
@@ -1524,15 +2391,18 @@ def handle_setup(argv: list) -> int:
     parser.add_argument("--json", dest="as_json", action="store_true", help="Output discovery or saved config as JSON")
     parser.add_argument("--backend", choices=["crouter", "native"], default=None, help="Execution backend (crouter or native)")
     parser.add_argument("--provider", default=None, help="Default provider (e.g. openrouter, ollama, claude)")
-    parser.add_argument("--model", default=None, help="Default model ID/alias")
-    parser.add_argument("--delegation-mode", choices=DELEGATION_MODES, default="proactive", help="Default team delegation posture")
-    parser.add_argument("--permission-mode", choices=PERMISSION_MODES, default="bypassPermissions", help="Default Claude permission mode")
+    parser.add_argument("-m", "--model", default=None, help="Default model ID/alias")
+    parser.add_argument("--delegation-mode", choices=DELEGATION_MODES, default=None, help="Default team delegation posture")
+    parser.add_argument("--permission-mode", choices=PERMISSION_MODES, default=None, help="Default Claude permission mode")
     parser.add_argument("--usage-policy", default=None, help="Free-form delegation/usage rules or reminders saved for agents")
     parser.add_argument(
         "--scenario", action="append", default=None,
         help="Optional per-agent/scenario route override as name=provider:model (repeatable)"
     )
     parser.add_argument("--note", default=None, help="Optional human note recorded in config")
+    parser.add_argument("--strict-mcp-default", dest="strict_mcp_default", action="store_true", default=None, help="Default to --strict-mcp-config for fast headless starts (default: true)")
+    parser.add_argument("--with-mcp-default", dest="strict_mcp_default", action="store_false", help="Default to loading global MCP servers on headless runs")
+    parser.add_argument("--replace", action="store_true", help="Replace existing configuration instead of merging partial flags")
 
     args = parser.parse_args(argv)
     env_info = discover_environment()
@@ -1545,13 +2415,18 @@ def handle_setup(argv: list) -> int:
         return 0
 
     has_write_flags = any(
-        [
+        x is not None
+        for x in (
             args.backend,
             args.provider,
             args.model,
+            args.delegation_mode,
+            args.permission_mode,
             args.usage_policy,
             args.scenario,
-        ]
+            args.note,
+            args.strict_mcp_default,
+        )
     )
 
     if not has_write_flags:
@@ -1582,13 +2457,19 @@ def handle_setup(argv: list) -> int:
         print(f"\nSaved persistent configuration to: {path}")
         return 0
 
-    existing = load_config() or {}
-    existing_scenarios = ((existing.get("policies") or {}).get("scenarioOverrides")) or {}
+    existing = {} if args.replace else (load_config() or {})
+    existing_route = existing.get("defaultRoute") or {}
+    existing_pol = existing.get("policies") or {}
+    existing_scenarios = existing_pol.get("scenarioOverrides") or {}
     try:
         scenarios = _parse_scenario_args(args.scenario, existing=existing_scenarios)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    eff_provider = args.provider if args.provider is not None else existing_route.get("provider")
+    eff_model = args.model if args.model is not None else existing_route.get("model")
+    eff_note = args.note if args.note is not None else existing_route.get("note")
 
     resolved_backend = args.backend
     if not resolved_backend:
@@ -1596,18 +2477,26 @@ def handle_setup(argv: list) -> int:
             resolved_backend = "native"
         elif args.provider:
             resolved_backend = "crouter"
+        elif existing_route.get("backend"):
+            resolved_backend = existing_route.get("backend")
         else:
             resolved_backend = "crouter" if env_info["crouter"]["installed"] else "native"
 
+    eff_delegation = args.delegation_mode if args.delegation_mode is not None else existing_pol.get("delegationMode", "proactive")
+    eff_permission = args.permission_mode if args.permission_mode is not None else existing_pol.get("permissionMode", "bypassPermissions")
+    eff_usage_policy = args.usage_policy if args.usage_policy is not None else existing_pol.get("usagePolicy", "")
+    eff_strict_mcp = args.strict_mcp_default if args.strict_mcp_default is not None else existing_pol.get("strictMcp", True)
+
     cfg = build_config_payload(
         backend=resolved_backend,
-        provider=args.provider,
-        model=args.model,
-        delegation_mode=args.delegation_mode,
-        usage_policy=args.usage_policy,
+        provider=eff_provider,
+        model=eff_model,
+        delegation_mode=eff_delegation,
+        usage_policy=eff_usage_policy,
         scenario_overrides=scenarios,
-        permission_mode=args.permission_mode,
-        note=args.note,
+        permission_mode=eff_permission,
+        note=eff_note,
+        strict_mcp=eff_strict_mcp,
     )
     path = save_config(cfg)
     if args.as_json:
@@ -1643,6 +2532,283 @@ def handle_config(argv: list) -> int:
     return 0
 
 
+def handle_models(argv: list) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-subagent models",
+        description="List saved default route, native Claude aliases, and configured crouter provider models.",
+    )
+    parser.add_argument("--json", dest="as_json", action="store_true", help="Output machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    env_info = discover_environment()
+    cfg = env_info.get("config") or {}
+    default_route = cfg.get("defaultRoute")
+    payload = {
+        "configured": env_info["configured"],
+        "defaultRoute": default_route,
+        "nativeAliases": list(NATIVE_CLAUDE_MODEL_ALIASES),
+        "claudeAvailable": env_info["claude"]["available"],
+        "crouter": env_info["crouter"],
+        "agents": env_info["agents"],
+    }
+    if args.as_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    lines = ["### Available Subagent Models & Routes"]
+    if default_route:
+        lines.append(
+            f"- **Saved Default**: `{default_route.get('backend')}` / "
+            f"`{default_route.get('provider') or 'auto'}` / `{default_route.get('model') or 'provider-default'}`"
+        )
+    else:
+        lines.append("- **Saved Default**: not configured yet (`claude-subagent setup --discover`)")
+
+    lines.append(f"- **Native Claude Aliases** (`-m sonnet|opus|haiku|fable` auto-routes to native `claude`): {', '.join(f'`{a}`' for a in NATIVE_CLAUDE_MODEL_ALIASES)}")
+
+    cr = env_info["crouter"]
+    if cr["installed"] and cr["providers"]:
+        lines.append("- **Configured `crouter` Providers** (`--provider <p> [-m <model>]`):")
+        for p in cr["providers"]:
+            lines.append(f"  - `{p['provider']}` ({p['status']}, auth={p['auth']}) → `{p['defaultModel']}`")
+    else:
+        lines.append("- **crouter**: not installed or no providers configured")
+
+    lines.append("")
+    lines.append("Usage: `claude-subagent -m <model> \"<task>\"` or `claude-subagent --provider <p> -m <model> \"<task>\"`")
+    print("\n".join(lines))
+    return 0
+
+
+def handle_doctor(argv: list) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-subagent doctor",
+        description="Read-only health check for claude-subagent config, binaries, routes, and workspace sessions.",
+    )
+    parser.add_argument("-C", "--cwd", "--workspace", dest="cwd", default=os.getcwd(), help="Target workspace directory")
+    parser.add_argument("--json", dest="as_json", action="store_true", help="Output machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    target_cwd = os.path.realpath(args.cwd or os.getcwd())
+    env_info = discover_environment()
+    cfg = env_info.get("config")
+    sessions = get_sessions_data(target_cwd) if os.path.isdir(target_cwd) else []
+
+    running_count = sum(1 for s in sessions if s.get("effective_status") == "running")
+    interrupted_count = sum(1 for s in sessions if s.get("effective_status") == "interrupted")
+
+    policies = (cfg or {}).get("policies") or {}
+    default_route = (cfg or {}).get("defaultRoute") or {}
+    report = {
+        "ok": bool(env_info["claude"]["available"] and env_info["configured"]),
+        "version": __version__,
+        "cwd": target_cwd,
+        "configPath": env_info["configPath"],
+        "configured": env_info["configured"],
+        "effectiveDefaultRoute": default_route if cfg else None,
+        "policies": {
+            "delegationMode": policies.get("delegationMode") if cfg else None,
+            "permissionMode": policies.get("permissionMode") if cfg else None,
+            "strictMcpDefault": policies.get("strictMcp", True) if cfg else True,
+            "usagePolicy": policies.get("usagePolicy") if cfg else None,
+            "scenarioOverrides": policies.get("scenarioOverrides", {}) if cfg else {},
+        },
+        "claude": env_info["claude"],
+        "crouter": env_info["crouter"],
+        "agents": env_info["agents"],
+        "sessionsSummary": {
+            "registryPath": get_registry_path(target_cwd),
+            "total": len(sessions),
+            "running": running_count,
+            "interrupted": interrupted_count,
+        },
+        "nextStep": None if env_info["configured"] else "Run `claude-subagent setup --discover` and persist a default route.",
+    }
+
+    if args.as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    lines = [
+        f"### claude-subagent Doctor (`v{__version__}`)",
+        format_discovery_report(env_info),
+    ]
+    if cfg:
+        lines.append(
+            f"- **Default Route**: `{default_route.get('backend')}` / "
+            f"`{default_route.get('provider') or 'auto'}` / `{default_route.get('model') or 'provider-default'}`"
+        )
+        lines.append(
+            f"- **Headless Defaults**: `strictMcp={policies.get('strictMcp', True)}`, "
+            f"`permissionMode={policies.get('permissionMode', 'bypassPermissions')}`, "
+            f"`delegationMode={policies.get('delegationMode', 'proactive')}`"
+        )
+        if policies.get("usagePolicy"):
+            lines.append(f"- **Usage Policy**: {policies['usagePolicy']}")
+    else:
+        lines.append("- **Next Step**: Run `claude-subagent setup --discover` and persist a default route.")
+
+    lines.append(
+        f"- **Workspace Sessions** (`{target_cwd}`): {len(sessions)} total "
+        f"(running: {running_count}, interrupted: {interrupted_count})"
+    )
+    print("\n".join(lines))
+    return 0
+
+
+def handle_sessions(argv: list) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-subagent sessions",
+        description="Inspect, show details, stop, delete, or clear workspace-bound subagent sessions.",
+    )
+    parser.add_argument(
+        "action", nargs="?", default="list",
+        choices=["list", "show", "stop", "delete", "clear"],
+        help="Session action (default: list)"
+    )
+    parser.add_argument("target", nargs="?", default=None, help="Session #id or UUID for show/stop/delete")
+    parser.add_argument("-C", "--cwd", "--workspace", dest="cwd", default=os.getcwd(), help="Target workspace directory")
+    parser.add_argument("--all", dest="show_all", action="store_true", help="List sessions across all tracked workspaces")
+    parser.add_argument("--json", dest="as_json", action="store_true", help="Output machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    target_cwd = os.path.realpath(args.cwd or os.getcwd())
+
+    if args.action == "list":
+        sessions = list_all_sessions() if args.show_all else get_sessions_data(target_cwd)
+        if args.as_json:
+            print(
+                json.dumps(
+                    {
+                        "cwd": None if args.show_all else target_cwd,
+                        "all": args.show_all,
+                        "registryPath": None if args.show_all else get_registry_path(target_cwd),
+                        "sessions": sessions,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        list_sessions(target_cwd, show_all=args.show_all)
+        return 0
+
+    if args.action == "show":
+        if not args.target:
+            msg = "Error: `sessions show` requires a session ID (e.g. `1`, `#1`, or `latest`)."
+            if args.as_json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+        entry = resolve_session_entry(target_cwd, args.target)
+        if not entry:
+            msg = f"Session '{args.target}' not found in workspace: {target_cwd}"
+            if args.as_json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+
+        enriched = next(
+            (s for s in get_sessions_data(target_cwd) if s.get("id") == entry.get("id")),
+            _enrich_session_entry(entry, workspace_cwd=target_cwd),
+        )
+        wt = enriched.get("worktree_path")
+        rec = {}
+        if wt and os.path.isdir(wt):
+            rec = recover_session_telemetry(wt, enriched.get("session_id"))
+        if not rec:
+            rec = recover_session_telemetry(target_cwd, enriched.get("session_id"))
+        enriched["transcript"] = rec
+
+        if args.as_json:
+            print(json.dumps({"ok": True, "cwd": target_cwd, "session": enriched}, indent=2, ensure_ascii=False))
+            return 0
+
+        lines = [
+            f"### Session #{enriched.get('id')} — {enriched.get('title')}",
+            f"- **Workspace**: `{target_cwd}`",
+            f"- **UUID**: `{enriched.get('session_id')}`",
+            f"- **Status**: `{enriched.get('effective_status', enriched.get('status', 'completed'))}`",
+            f"- **Model**: `{enriched.get('model')}` | **Turns**: {enriched.get('turns')}",
+            f"- **Updated**: {enriched.get('updated_at')}",
+        ]
+        if wt:
+            lines.append(f"- **Worktree**: `{wt}`")
+        act = enriched.get("last_activity") or rec.get("last_activity")
+        if act:
+            lines.append(f"- **Last Activity**: {act}")
+        if rec.get("transcript_path"):
+            lines.append(f"- **Transcript**: `{rec['transcript_path']}`")
+        print("\n".join(lines))
+        return 0
+
+    if args.action == "stop":
+        if not args.target:
+            msg = "Error: `stop` requires a session ID (e.g. `1` or `latest`)."
+            if args.as_json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+        res = stop_session(target_cwd, args.target)
+        if args.as_json:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+            return 0 if res.get("ok") else 1
+        if res.get("ok"):
+            verb = "Stopped running" if res.get("wasRunning") else "Session already idle"
+            print(f"{verb}: #{res['id']} (status: {res['status']})")
+            return 0
+        print(res.get("error"), file=sys.stderr)
+        return 1
+
+    if args.action == "delete":
+        if not args.target:
+            msg = "Error: `sessions delete` requires a session ID."
+            if args.as_json:
+                print(json.dumps({"ok": False, "error": msg}, indent=2, ensure_ascii=False))
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+        entry = resolve_session_entry(target_cwd, args.target)
+        if entry and entry.get("status") == "running" and _is_pid_alive(entry.get("pid")):
+            _terminate_pid_group(entry["pid"], grace_sec=2.0)
+        ok = delete_session(target_cwd, args.target)
+        if args.as_json:
+            print(json.dumps({"ok": ok, "cwd": target_cwd, "target": args.target}, indent=2, ensure_ascii=False))
+            return 0 if ok else 1
+        if ok:
+            print(f"Deleted session '{args.target}' for: {target_cwd}")
+            return 0
+        print(f"Session '{args.target}' not found in: {target_cwd}", file=sys.stderr)
+        return 1
+
+    removed = clear_sessions(target_cwd)
+    if args.as_json:
+        print(json.dumps({"ok": True, "cwd": target_cwd, "removed": removed}, indent=2, ensure_ascii=False))
+    else:
+        print(f"Cleared {removed} session(s) for: {target_cwd}")
+    return 0
+
+
+def _handle_target_verb(action: str, argv: list) -> int:
+    """Handle top-level target verbs like `show <id>`, `stop <id>`, `rm <id>` regardless of flag order."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-C", "--cwd", "--workspace", dest="cwd", default=os.getcwd())
+    parser.add_argument("--json", dest="as_json", action="store_true")
+    parser.add_argument("positionals", nargs="*")
+    ns, _ = parser.parse_known_args(argv)
+
+    cmd_argv = [action]
+    if ns.positionals:
+        cmd_argv.append(ns.positionals[0])
+    cmd_argv.extend(["--cwd", ns.cwd])
+    if ns.as_json:
+        cmd_argv.append("--json")
+    return handle_sessions(cmd_argv)
+
+
 # ---------------------------------------------------------------------------
 # Main CLI Entrypoint
 # ---------------------------------------------------------------------------
@@ -1651,13 +2817,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-subagent",
         description=(
-            "Headless Claude Code subagent runner with persistent first-run setup, "
-            "numbered sessions, worktree isolation, and delta diff reporting.\n\n"
-            "Management commands:\n"
-            "  claude-subagent setup [--discover | --backend ... --provider ... --model ...]\n"
-            "  claude-subagent config show|path|reset"
+            "Native-grade headless Claude Code subagent runner with target-workspace session binding, "
+            "flexible model selection, fast headless defaults, live progress streaming, and git worktree isolation.\n\n"
+            "Quick commands:\n"
+            "  claude-subagent \"<task>\"                        Spawn in current dir (or pass -C <dir>)\n"
+            "  claude-subagent -C <dir> \"<task>\"               Spawn bound to target workspace <dir>\n"
+            "  claude-subagent -m <model> \"<task>\"             One-shot model override (keeps default otherwise)\n"
+            "  claude-subagent -w \"<task>\"                     Spawn in an isolated git worktree\n"
+            "  claude-subagent --readonly \"<task>\"             Spawn a read-only scout/reviewer\n"
+            "  claude-subagent send <id> \"<message>\"           Continue session #id in target workspace\n"
+            "  claude-subagent fork <id> \"<message>\"           Branch session #id into a new #id\n"
+            "  claude-subagent ps [--all]                      List sessions in workspace (or across all)\n"
+            "  claude-subagent show|stop|rm <id>               Inspect, stop, or remove session #id\n"
+            "  claude-subagent models [--json]                 List saved default, native aliases & crouter models\n"
+            "  claude-subagent doctor [--json]                 Check config, binaries & workspace sessions\n"
+            "  claude-subagent setup | config | sessions"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "positionals", nargs="*",
+        help="Task prompt (positional shorthand for -p/--prompt)"
     )
     parser.add_argument(
         "-V", "--version", action="version", version=f"%(prog)s {__version__}",
@@ -1667,29 +2847,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-l", "--list", "--list-sessions", dest="list_sessions", action="store_true",
-        help="List all numbered subagent sessions in the target directory"
+        help="List numbered subagent sessions for the target workspace"
     )
     parser.add_argument(
         "--delete-session", default=None,
-        help="Remove a session entry by number (e.g. 1 or #1) or UUID from the target directory"
+        help="Remove a session entry by number (e.g. 1 or #1) or UUID"
     )
     parser.add_argument(
         "--clear-sessions", action="store_true",
-        help="Clear all recorded session entries for the target directory"
+        help="Clear all recorded session entries for the target workspace"
     )
     parser.add_argument(
         "--provider", default=None,
         help="One-shot provider override (bypasses persisted default; use 'claude' for native Anthropic)"
     )
     parser.add_argument(
-        "--model", default=None, help="One-shot model override (passed with crouter --once when crouter is active)"
+        "-m", "--model", default=None,
+        help="One-shot model override (auto-routes native sonnet/opus/haiku/fable/claude-*, else inherits default provider)"
+    )
+    parser.add_argument(
+        "--fallback-model", default=None,
+        help="Comma-separated fallback model(s) passed to Claude --fallback-model"
     )
     parser.add_argument(
         "--allow-unconfigured", action="store_true",
         help="Bypass the first-run setup gate for a one-off invocation"
     )
     parser.add_argument(
-        "--cwd", default=os.getcwd(), help="Target working directory"
+        "-C", "--cwd", "--workspace", dest="cwd", default=os.getcwd(),
+        help="Target workspace directory (sessions #1, #2 bind to this folder)"
     )
     parser.add_argument(
         "-r", "--resume", default=None,
@@ -1697,7 +2883,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-c", "--continue-session", action="store_true",
-        help="Continue the most recent session in this directory"
+        help="Continue the most recent session in the target workspace"
+    )
+    parser.add_argument(
+        "--fork", "--fork-session", dest="fork_session", action="store_true",
+        help="When used with -r, -c, or fork verb, branch into a new numbered session (--fork-session)"
+    )
+    parser.add_argument(
+        "--ephemeral", "--no-session-persistence", dest="ephemeral", action="store_true",
+        help="Skip saving session transcript and registry entry (--no-session-persistence)"
     )
     parser.add_argument(
         "-w", "--worktree", nargs="?", const=True, default=None,
@@ -1705,11 +2899,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-n", "--name", "--title", dest="title", default=None,
-        help="Custom display title for this session (shown in --list and Claude -n)"
+        help="Custom display title for this session (auto-derived from prompt if omitted)"
     )
     parser.add_argument(
         "--agent", default=None,
         help="Invoke a specific Claude Code agent definition (from ~/.claude/agents/ or .claude/agents/)"
+    )
+    parser.add_argument(
+        "--role", choices=["research", "review", "implement"], default=None,
+        help="Quick role preset (maps to workflow-researcher/reviewer/implementer or readonly fallback)"
+    )
+    parser.add_argument(
+        "-R", "--readonly", action="store_true",
+        help="Read-only shorthand (equivalent to --allowed-tools readonly)"
     )
     parser.add_argument(
         "--effort", default=None, choices=["low", "medium", "high", "xhigh", "max"],
@@ -1750,15 +2952,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Append instructions to the default Claude Code system prompt"
     )
     parser.add_argument(
+        "--json-schema", default=None,
+        help="JSON Schema string or path to a schema file for structured output (--json-schema)"
+    )
+    parser.add_argument(
         "--bare", action="store_true",
         help="Minimal mode: pass native --bare (skips hooks, plugins, and settings)"
     )
     parser.add_argument(
         "--strict-mcp", "--strict-mcp-config", dest="strict_mcp", action="store_true",
-        help="Skip external MCP servers via native --strict-mcp-config without disabling hooks/agents"
+        help="Skip external MCP servers via native --strict-mcp-config (enabled by default)"
     )
     parser.add_argument(
-        "--raw-json", action="store_true", help="Print raw JSON output instead of formatted delivery report"
+        "--with-mcp", action="store_true",
+        help="Load global/project MCP servers instead of skipping them via --strict-mcp-config"
+    )
+    parser.add_argument(
+        "--mcp-config", action="append", default=None,
+        help="Load specific MCP config JSON file or string (repeatable, implies --strict-mcp-config)"
+    )
+    parser.add_argument(
+        "--chrome", action="store_true",
+        help="Enable Claude in Chrome integration (disabled via --no-chrome by default)"
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Suppress live progress lines emitted to stderr"
+    )
+    parser.add_argument(
+        "--json", dest="json_output", action="store_true",
+        help="Emit structured machine-readable JSON delivery envelope to stdout"
+    )
+    parser.add_argument(
+        "--raw-json", action="store_true", help="Print raw Claude JSON result payload instead of formatted report"
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print resolved route & command as JSON without invoking Claude"
@@ -1769,50 +2995,124 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
 
-    if raw_argv and raw_argv[0] == "setup":
+    verb = raw_argv[0] if raw_argv else None
+    if verb == "setup":
         sys.exit(handle_setup(raw_argv[1:]))
-    if raw_argv and raw_argv[0] == "config":
+    if verb == "config":
         sys.exit(handle_config(raw_argv[1:]))
+    if verb == "models":
+        sys.exit(handle_models(raw_argv[1:]))
+    if verb == "doctor":
+        sys.exit(handle_doctor(raw_argv[1:]))
+    if verb == "sessions":
+        sys.exit(handle_sessions(raw_argv[1:]))
+    if verb in ("list", "ps"):
+        sys.exit(handle_sessions(["list"] + raw_argv[1:]))
+    if verb == "show":
+        sys.exit(_handle_target_verb("show", raw_argv[1:]))
+    if verb == "stop":
+        sys.exit(_handle_target_verb("stop", raw_argv[1:]))
+    if verb in ("rm", "close"):
+        sys.exit(_handle_target_verb("delete", raw_argv[1:]))
+    if verb == "clear":
+        sys.exit(handle_sessions(["clear"] + raw_argv[1:]))
+
+    sub_verb = None
+    preset_resume = None
+    if verb in ("run", "send", "reply", "followup", "resume", "fork"):
+        sub_verb = verb
+        raw_argv = raw_argv[1:]
+        if sub_verb in ("send", "reply", "followup", "resume", "fork") and raw_argv and not raw_argv[0].startswith("-") and raw_argv[0] != "--":
+            preset_resume = raw_argv[0]
+            raw_argv = raw_argv[1:]
+
+    extra_claude_args = None
+    if "--" in raw_argv:
+        sep_idx = raw_argv.index("--")
+        cli_argv = raw_argv[:sep_idx]
+        extra_claude_args = raw_argv[sep_idx + 1:]
+    else:
+        cli_argv = raw_argv
 
     parser = build_parser()
-    args = parser.parse_args(raw_argv)
+    args = parser.parse_args(cli_argv)
 
     if args.clear_sessions:
         removed = clear_sessions(args.cwd)
-        print(f"Cleared {removed} session(s) for: {os.path.abspath(args.cwd)}")
+        if args.json_output:
+            print(json.dumps({"ok": True, "cwd": os.path.realpath(args.cwd), "removed": removed}, indent=2, ensure_ascii=False))
+        else:
+            print(f"Cleared {removed} session(s) for: {os.path.realpath(args.cwd)}")
         sys.exit(0)
 
     if args.delete_session:
         ok = delete_session(args.cwd, args.delete_session)
+        if args.json_output:
+            print(json.dumps({"ok": ok, "cwd": os.path.realpath(args.cwd), "target": args.delete_session}, indent=2, ensure_ascii=False))
+            sys.exit(0 if ok else 1)
         if ok:
-            print(f"Deleted session '{args.delete_session}' for: {os.path.abspath(args.cwd)}")
+            print(f"Deleted session '{args.delete_session}' for: {os.path.realpath(args.cwd)}")
             sys.exit(0)
-        print(f"Session '{args.delete_session}' not found in: {os.path.abspath(args.cwd)}", file=sys.stderr)
+        print(f"Session '{args.delete_session}' not found in: {os.path.realpath(args.cwd)}", file=sys.stderr)
         sys.exit(1)
 
     if args.list_sessions:
+        if args.json_output:
+            sys.exit(handle_sessions(["list", "--cwd", args.cwd, "--json"]))
         list_sessions(args.cwd)
         sys.exit(0)
 
-    if not args.prompt:
+    pos = list(args.positionals or [])
+    if sub_verb in ("send", "reply", "followup", "resume", "fork") and not preset_resume and not args.resume and pos:
+        preset_resume = pos.pop(0)
+
+    eff_resume = args.resume or preset_resume
+    eff_fork = args.fork_session or (sub_verb == "fork")
+
+    if sub_verb in ("send", "reply", "followup", "resume", "fork") and not eff_resume and not args.continue_session:
+        print(f"Error: `{sub_verb}` requires a session ID (e.g. `claude-subagent {sub_verb} 1 \"...\"`).", file=sys.stderr)
+        sys.exit(1)
+
+    eff_prompt = args.prompt or (" ".join(pos) if pos else None)
+    eff_worktree = args.worktree
+
+    if not eff_prompt and not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+        if stdin_data and stdin_data.strip():
+            eff_prompt = stdin_data
+
+    # Smart `-w "<prompt>"` promotion when no separate prompt was passed
+    if not eff_prompt and isinstance(eff_worktree, str) and (" " in eff_worktree or "\n" in eff_worktree or len(eff_worktree) > 40):
+        eff_prompt = eff_worktree
+        eff_worktree = True
+
+    if not eff_prompt:
+        if sub_verb in ("send", "reply", "followup", "resume", "fork"):
+            print(f"Error: Missing message for `{sub_verb}`.", file=sys.stderr)
+            sys.exit(1)
         parser.print_help()
         sys.exit(1)
 
     exit_code, output = execute_subagent(
-        prompt=args.prompt,
+        prompt=eff_prompt,
         cwd=args.cwd,
-        resume=args.resume,
+        resume=eff_resume,
         continue_session=args.continue_session,
-        worktree=args.worktree,
+        worktree=eff_worktree,
         model=args.model,
         provider=args.provider,
         budget=args.budget,
         timeout=args.timeout,
         bare=args.bare,
         strict_mcp=args.strict_mcp,
+        with_mcp=args.with_mcp,
+        mcp_configs=args.mcp_config,
+        chrome=args.chrome,
         allowed_tools=args.allowed_tools or args.tools,
         disallowed_tools=args.disallowed_tools,
         agent=args.agent,
+        role=args.role,
+        readonly=args.readonly,
         effort=args.effort,
         title=args.title,
         add_dirs=args.add_dir,
@@ -1821,7 +3121,14 @@ def main(argv=None):
         allow_unconfigured=args.allow_unconfigured,
         max_output_chars=args.max_output_chars,
         raw_json=args.raw_json,
+        json_output=args.json_output,
         dry_run=args.dry_run,
+        quiet=args.quiet,
+        fork_session=eff_fork,
+        fallback_model=args.fallback_model,
+        json_schema=args.json_schema,
+        ephemeral=args.ephemeral,
+        extra_claude_args=extra_claude_args,
     )
 
     print(output)

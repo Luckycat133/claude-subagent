@@ -1,23 +1,55 @@
 # Recipes, Setup & Flag Reference (`claude-subagent`)
 
-## 1. First-Run Setup & Config Management
+## 1. Everyday Native-Grade Recipes
 
 ```bash
-# Inspect available Claude CLI, optional crouter providers/models, local agents & config status:
+# Minimal spawn (bound to current directory, saved default route & fast headless defaults):
+claude-subagent "Fix the off-by-one bug in parser.py and run pytest -q."
+
+# Target a specific workspace from anywhere (`-C` / `--cwd` / `--workspace`):
+claude-subagent -C /path/to/repo --readonly "Trace where session cleanup leaks occur."
+
+# Multi-line brief via auto-stdin:
+claude-subagent -C /path/to/repo --role implement <<'EOF'
+Goal: Return structured 401 JSON errors for expired tokens in src/auth/.
+Scope: src/auth/errors.py, src/auth/middleware.py, tests/test_auth_errors.py.
+Verification: pytest tests/test_auth_errors.py -q
+EOF
+
+# Freely override model per call (saved default stays intact):
+claude-subagent models                                      # list default, native aliases & crouter models
+claude-subagent -m sonnet "Review complex race condition."  # auto-routes to native claude
+claude-subagent -m deepseek/deepseek-r1:free "Analyze bug." # inherits persisted openrouter provider
+claude-subagent --provider ollama "Summarize local diff."   # uses ollama's default model
+
+# Worktree isolation (auto-named branch or explicit branch name):
+claude-subagent -w "Implement rate limiter middleware and add tests."
+claude-subagent -w feat-ratelimit "Implement rate limiter middleware."
+
+# Follow-up, fork, inspect, stop & clean up (bound to target workspace):
+claude-subagent send 1 -C /path/to/repo "Cover missing Authorization header and re-run pytest."
+claude-subagent fork 1 -C /path/to/repo "Try an alternative middleware design."
+claude-subagent ps -C /path/to/repo
+claude-subagent ps --all          # list across all tracked workspaces
+claude-subagent show 1 -C /path/to/repo --json
+claude-subagent stop 1 -C /path/to/repo
+claude-subagent rm 1 -C /path/to/repo
+```
+
+## 2. Health Check, Discovery & Setup
+
+```bash
+# Read-only health check (config, binaries, route, and target workspace sessions):
+claude-subagent doctor --json -C /path/to/repo
+
+# Inspect available Claude CLI, optional crouter providers/models & local agents:
 claude-subagent setup --discover
 claude-subagent setup --discover --json
 
-# Interactive setup wizard (in a terminal):
-claude-subagent setup
+# Non-interactive setup (Native Claude Code directly):
+claude-subagent setup --backend native --provider claude --delegation-mode proactive
 
-# Non-interactive setup (e.g. persisted by an agent after user confirmation):
-# Example A — Native Claude Code directly (no crouter needed):
-claude-subagent setup \
-  --backend native \
-  --provider claude \
-  --delegation-mode proactive
-
-# Example B — Paired with crouter:
+# Non-interactive setup (paired with crouter):
 claude-subagent setup \
   --backend crouter \
   --provider openrouter \
@@ -25,91 +57,86 @@ claude-subagent setup \
   --delegation-mode proactive \
   --usage-policy "Use proactively; remind user when special boundaries apply."
 
+# Partial update (merges onto existing config without wiping other fields):
+claude-subagent setup --delegation-mode ask-first
+
 # Inspect or reset persisted configuration:
 claude-subagent config show
 claude-subagent config path
 claude-subagent config reset
 ```
 
-## 2. Everyday Delegation Recipes
+## 3. Structured JSON, Opt-In Capabilities & Raw Passthrough
 
-### Scoped Implementation in an Isolated Worktree
 ```bash
-claude-subagent \
-  --cwd "/abs/path/to/repo" \
-  --title "Auth 401 error refactor" \
-  --allowed-tools coding \
-  --effort medium \
-  -w "refactor-auth" \
-  -p - <<'EOF'
-Goal: Return structured 401 JSON errors for expired tokens in src/auth/.
-Scope: src/auth/errors.py, src/auth/middleware.py, tests/test_auth_errors.py.
-Boundaries: Do not modify src/billing/ or public response keys for valid tokens.
-Verification: pytest tests/test_auth_errors.py -q
-EOF
+# Machine-readable JSON envelope + schema-validated response:
+claude-subagent --readonly --json \
+  --json-schema '{"type":"object","properties":{"issues":{"type":"array"}},"required":["issues"]}' \
+  "Audit src/auth/ for missing error handling."
+
+# Opt in to global MCP servers, specific MCP config, or Chrome integration:
+claude-subagent --with-mcp "Use configured MCP tool X..."
+claude-subagent --mcp-config ./mcp.json "Run targeted MCP workflow..."
+claude-subagent --chrome "Inspect live browser tab..."
+
+# Raw passthrough to native `claude` flags after `--`:
+claude-subagent "Quick check" -- --disable-slash-commands
 ```
 
-### Fast Read-Only Scout or Independent Reviewer
-```bash
-claude-subagent \
-  --cwd "/abs/path/to/repo" \
-  --title "Review auth refactor" \
-  --agent workflow-reviewer \
-  --allowed-tools readonly \
-  --strict-mcp \
-  --effort medium \
-  -p "Review git diff in src/auth/ against requirement X. Report concrete defects with file:line, trigger, impact, and minimal fix."
-```
+## 4. Complete Command & Flag Reference
 
-### Stateful Follow-Up & Session Management
-```bash
-claude-subagent --cwd "/abs/path/to/repo" --list
-claude-subagent --cwd "/abs/path/to/repo" -r 1 -p "Fix missing Authorization header edge case in middleware.py:42 and re-run pytest."
-claude-subagent --cwd "/abs/path/to/repo" -c -p "Re-run full auth test suite and report exit code."
-claude-subagent --cwd "/abs/path/to/repo" --delete-session 1
-claude-subagent --cwd "/abs/path/to/repo" --clear-sessions
-```
-
-### Dry-Run Route Inspection
-```bash
-claude-subagent --cwd "/abs/path/to/repo" --title "Check route" --dry-run -p "hello"
-```
-
-## 3. Complete Flag & Environment Reference
-
-### Management Subcommands
-- `claude-subagent setup [--discover] [--json] [--backend crouter|native] [--provider <p>] [--model <m>] [--delegation-mode proactive|ask-first|explicit-only] [--permission-mode <mode>] [--usage-policy <text>] [--scenario name=provider:model] [--note <text>]`
+### Native-Style & Management Subcommands
+- `claude-subagent [run] ["<prompt>"] [flags...] [-- <extra claude args...>]`
+- `claude-subagent send <id> ["<message>"] [flags...]` (aliases: `reply`, `followup`, `resume`)
+- `claude-subagent fork <id> ["<message>"] [flags...]`
+- `claude-subagent ps [--all] [-C|--cwd|--workspace <dir>] [--json]` (alias: `list`)
+- `claude-subagent show <id> [-C|--cwd|--workspace <dir>] [--json]`
+- `claude-subagent stop <id> [-C|--cwd|--workspace <dir>] [--json]`
+- `claude-subagent rm <id> [-C|--cwd|--workspace <dir>] [--json]` (alias: `close`)
+- `claude-subagent clear [-C|--cwd|--workspace <dir>] [--json]`
+- `claude-subagent sessions [list|show <id>|stop <id>|delete <id>|clear] [--all] [-C|--cwd|--workspace <dir>] [--json]`
+- `claude-subagent models [--json]`
+- `claude-subagent doctor [-C|--cwd|--workspace <dir>] [--json]`
+- `claude-subagent setup [--discover] [--json] [--backend ...] [--provider ...] [-m|--model ...] [--delegation-mode ...] [--permission-mode ...] [--usage-policy ...] [--scenario name=provider:model] [--strict-mcp-default|--with-mcp-default] [--note ...] [--replace]`
 - `claude-subagent config show | path | reset`
 
 ### Execution Flags
 | Flag | Description |
 |---|---|
-| `-p, --prompt <text\|file\|->` | Inline prompt, file path, or `-` to read from stdin |
-| `--cwd <dir>` | Target working directory (default: current directory) |
-| `-n, --name, --title <text>` | Human-readable title shown in `--list` and passed to Claude `-n` |
-| `-l, --list` | List numbered sessions (`#1`, `#2`, ...) for `--cwd` |
-| `-r, --resume <num\|uuid>` | Resume session by number (`1`, `#1`) or raw UUID |
-| `-c, --continue-session` | Continue the most recent session in `--cwd` |
-| `--delete-session <num\|uuid>` | Remove one recorded session entry |
-| `--clear-sessions` | Clear all recorded session entries for `--cwd` |
-| `-w, --worktree [name]` | Isolate execution in a git worktree (optional name) |
-| `--agent <name>` | Invoke a Claude Code agent from `~/.claude/agents/` or `.claude/agents/` |
+| `prompt` (positional) / `-p, --prompt <text\|file\|->` | Inline prompt, file path, `-`, or automatic piped `stdin` |
+| `-C, --cwd, --workspace <dir>` | Target workspace directory (sessions `#1`, `#2` bind to this folder) |
+| `-n, --name, --title <text>` | Custom display title (auto-derived from prompt if omitted) |
+| `-r, --resume <num\|uuid>` | Resume session by number (`1`, `#1`) or UUID (preserves worktree tracking) |
+| `-c, --continue-session` | Continue the most recent session in the target workspace |
+| `--fork, --fork-session` | Branch from `-r`/`-c` into a new numbered session (`--fork-session`) |
+| `--ephemeral, --no-session-persistence` | Skip saving transcript and registry entry |
+| `-w, --worktree [name]` | Isolate execution in a git worktree (auto-promotes `-w "<prompt>"` when no separate prompt is passed) |
+| `-R, --readonly` | Read-only shorthand (`--allowed-tools readonly`) |
+| `--role <research\|review\|implement>` | Role preset (uses `~/.claude/agents/workflow-*` if installed, else safe tool preset) |
+| `--agent <name>` | Invoke a specific Claude Code agent definition |
 | `--effort <level>` | Reasoning effort: `low`, `medium`, `high`, `xhigh`, `max` |
 | `--allowed-tools <csv\|preset>` | Tool whitelist (`coding`, `readonly`, or comma-separated tool names) |
 | `--disallowed-tools <csv>` | Deny specific tools (`--disallowedTools`) |
 | `--add-dir <dir>` | Grant tool access to additional directory (repeatable) |
 | `--append-system-prompt <text>` | Append extra instructions to default system prompt |
-| `--strict-mcp` | Skip external MCP servers (`--strict-mcp-config`) while keeping hooks/agents |
+| `--json-schema <json\|file>` | Enforce structured JSON output schema (inline JSON or file path) |
+| `--strict-mcp` / `--with-mcp` | Skip external MCP servers by default (`--strict-mcp`), or load them (`--with-mcp`) |
+| `--mcp-config <file\|json>` | Load specific MCP config(s) (repeatable, implies `--strict-mcp-config`) |
+| `--chrome` | Enable Claude in Chrome integration (disabled via `--no-chrome` by default) |
 | `--bare` | Minimal mode skipping hooks, plugins, and settings |
 | `--permission-mode <mode>` | Permission mode override (default from config or `bypassPermissions`) |
-| `--provider <name>` | One-shot provider override (`claude` for native Anthropic; other providers via `crouter --once`) |
-| `--model <id>` | One-shot model override |
+| `--provider <name>` | One-shot provider override (`claude` for native; other providers via `crouter --once`) |
+| `-m, --model <id>` | One-shot model override (`sonnet`/`opus`/`haiku`/`fable`/`claude-*` auto-route native; else inherit saved provider) |
+| `--fallback-model <csv>` | Fallback model list passed to `--fallback-model` |
 | `--allow-unconfigured` | One-off bypass of first-run setup gate |
 | `--budget <usd>` | Pass `--max-budget-usd` spend ceiling |
 | `--timeout <sec>` | Optional process-group timeout in seconds (default: unlimited) |
 | `--max-output-chars <n>` | Optional cap on delivery report length in chars (default: unlimited) |
-| `--raw-json` | Print raw Claude JSON payload |
+| `-q, --quiet` | Suppress live progress lines emitted to `stderr` |
+| `--json` | Emit structured JSON delivery envelope to `stdout` |
+| `--raw-json` | Print raw Claude JSON result payload |
 | `--dry-run` | Print resolved route & command as JSON without invoking Claude |
+| `-- <args...>` | Raw escape hatch passing remaining flags directly to `claude` |
 | `-V, --version` | Print `claude-subagent` version |
 
 ### Environment Variables

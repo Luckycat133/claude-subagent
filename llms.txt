@@ -1,6 +1,6 @@
 # claude-subagent
 
-> Skill + CLI architecture turning Claude Code (native or paired with `crouter`) into a persistent, worktree-isolated subagent pool with numbered sessions (#1, #2) and zero external dependencies.
+> Native-grade Skill + CLI architecture turning Claude Code (native or paired with `crouter`) into a fast, streaming, target-workspace-bound, worktree-isolated subagent pool with `send`, `fork`, `ps`, `stop`, `models`, `doctor`, and zero external dependencies.
 
 - [README](README.md): Overview, installation (`npx skills add Luckycat133/claude-subagent`, `uv tool install`, `./install.sh`), first-run setup, and quickstart.
 - [README (简体中文)](README.zh-CN.md): Chinese documentation.

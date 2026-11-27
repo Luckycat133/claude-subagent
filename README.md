@@ -1,6 +1,6 @@
 # claude-subagent
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
@@ -11,7 +11,7 @@ English | [简体中文](README.zh-CN.md)
 
 Works out of the box with **native Claude Code**—no extra routing tool required. Pairs even better with [`crouter`](https://github.com/Luckycat133/crouter) if you want multi-provider, local Ollama, or free-tier model routing.
 
-Compatible with **Antigravity**, **Codex**, **Cursor**, **Windsurf**, **Gemini CLI**, **OpenClaw**, **Cline**, and **Claude Code** itself—with **zero permanent MCP server overhead** and **zero third-party Python dependencies**.
+Compatible with **Antigravity**, **Codex**, **Cursor**, **Windsurf**, **Gemini CLI**, **OpenClaw**, and **Cline**—with **zero permanent MCP server overhead** and **zero third-party Python dependencies**. (Claude Code already has built-in `Agent` subagents, so the Skill is aimed at external orchestrators.)
 
 ```text
           +--------------------------------------------------+
@@ -36,11 +36,13 @@ Compatible with **Antigravity**, **Codex**, **Cursor**, **Windsurf**, **Gemini C
 
 ## Key Features
 
-- **Mandatory first-run setup & persistent policy** (`~/.config/claude-subagent/config.json`): On first run, discovers configured models (`claude` native and optional `crouter` providers), prompts the user to confirm a persistent default route + delegation/usage policy, and remembers it across every future agent session—so no subagent ever silently picks an unconfirmed model.
-- **Works great standalone, even better with `crouter`**: Runs native `claude` out of the box. When [`crouter`](https://github.com/Luckycat133/crouter) is installed, supports provider/model selection and optional per-scenario overrides while always passing `--once` so your global `crouter use` default stays untouched.
-- **Unattended execution with scoped safety**: Defaults to `bypassPermissions` so headless workers never stall on interactive TTY prompts (preserving the token-saving purpose of subagents), while enforcing safety via `--allowed-tools readonly|coding`, `-w <branch>` worktree isolation, and `--timeout`/`--budget`.
-- **Zero idle token tax (`Skill + CLI`)**: No always-on MCP schemas; progressive Agent Skill (`skills/claude-subagent/`) teaches any host agent when to spin up a team proactively, how to write concise outcome-oriented briefs, and how to recover from exceptions.
-- **Parallel-safe & clean teardown**: File-locked atomic numbered sessions (`#1`, `#2`, `-r 1`, `-c`), dirty-tree run-delta Git diffing, and process-group timeout cleanup (`SIGINT → SIGTERM → SIGKILL`).
+- **Native-grade zero-ceremony CLI**: Spawn with `claude-subagent "do X"`, `claude-subagent -C /repo --readonly "..."`, or `claude-subagent -w "..."` without repeating boilerplate flags—defaults handle route, title, `--strict-mcp-config`, and `--no-chrome` (~0.4s local startup).
+- **Target-workspace session binding (IDE-agnostic)**: Sessions (`#1`, `#2`, `-c`, `send`, `ps`, `stop`) bind strictly to the specified target workspace (`-C` / `--cwd` / `--workspace`) via `realpath`, working identically across every IDE without host-specific adapters (`ps --all` lists across all workspaces).
+- **Flexible model selection with preserved default**: Keeps your configured default route while allowing one-shot `-m <model>` overrides (`sonnet`/`opus`/`haiku`/`fable`/`claude-*` auto-route native, others inherit your saved provider), `--provider <p>`, and `claude-subagent models`.
+- **Native-style worker verbs & live progress**: `send <id> "msg"`, `fork <id> "msg"`, `ps`, `show <id>`, `stop <id>`, `rm <id>`, `doctor --json`, and structured `--json` output, backed by real-time `stream-json` `stderr` progress and stale-PID detection.
+- **Mandatory first-run setup & persistent policy** (`~/.config/claude-subagent/config.json`): Discovers configured models (`claude` native and optional `crouter` providers), confirms a persistent default route + delegation/usage policy once, and merges partial `setup` updates safely.
+- **Works great standalone, even better with `crouter`**: Runs native `claude` out of the box. When [`crouter`](https://github.com/Luckycat133/crouter) is installed, supports provider/model routing while always passing `--once` so your global `crouter use` default stays untouched.
+- **Zero idle token tax (`Skill + CLI`)**: No always-on MCP schemas; progressive Agent Skill (`skills/claude-subagent/`) and stdlib-only Python 3.9+ CLI.
 
 ## Installation
 
@@ -105,25 +107,24 @@ claude-subagent setup \
 ### Step 2 — Run, Resume & Review
 
 ```bash
-# Preview resolved route & command without invoking Claude:
-claude-subagent --cwd /path/to/repo --title "Dry run" --dry-run -p "Hello"
+# Inspect health, models & workspace sessions:
+claude-subagent doctor --json
+claude-subagent models
 
-# Dispatch a scoped coding worker in an isolated git worktree:
-claude-subagent \
-  --cwd /path/to/repo \
-  --title "Auth 401 error refactor" \
-  --allowed-tools coding \
-  --effort medium \
-  -w "refactor-auth" \
-  -p - <<'EOF'
-Goal: Return structured 401 JSON errors for expired tokens in src/auth/.
-Scope: src/auth/errors.py, src/auth/middleware.py, tests/test_auth_errors.py.
-Verification: pytest tests/test_auth_errors.py -q
-EOF
+# Minimal zero-ceremony spawn & target-workspace scout:
+claude-subagent "Fix the off-by-one bug in parser.py and run pytest -q."
+claude-subagent -C /path/to/repo --readonly "Audit src/auth/ for missing token checks."
+claude-subagent -m sonnet "Review this critical concurrency fix."
 
-# List sessions & send a surgical follow-up to session #1:
-claude-subagent --cwd /path/to/repo --list
-claude-subagent --cwd /path/to/repo -r 1 -p "Handle missing Authorization header and re-run pytest."
+# Scoped coding worker in an isolated git worktree:
+claude-subagent -w "Refactor auth 401 errors in src/auth/ and run pytest tests/test_auth_errors.py -q."
+
+# Inspect sessions, follow up, fork, or stop:
+claude-subagent ps -C /path/to/repo
+claude-subagent show 1 -C /path/to/repo
+claude-subagent send 1 -C /path/to/repo "Handle missing Authorization header and re-run pytest."
+claude-subagent fork 1 -C /path/to/repo "Try alternative middleware design."
+claude-subagent stop 1 -C /path/to/repo
 ```
 
 ## Project Layout (`Skill + CLI`)

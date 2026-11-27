@@ -1,6 +1,6 @@
 # claude-subagent
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
@@ -11,15 +11,17 @@
 
 不依赖任何第三方路由工具，**直接调用原生 Claude Code 即可使用**；如果搭配 [`crouter`](https://github.com/Luckycat133/crouter) 效果更佳（支持多供应商、本地模型或免费模型统一路由）。
 
-开箱适配 **Antigravity**、**Codex**、**Cursor**、**Windsurf**、**Gemini CLI**、**OpenClaw**、**Cline** 及 **Claude Code** 自身；**零常驻 MCP 负担**，**零第三方 Python 依赖**。
+开箱适配 **Antigravity**、**Codex**、**Cursor**、**Windsurf**、**Gemini CLI**、**OpenClaw** 与 **Cline**；**零常驻 MCP 负担**，**零第三方 Python 依赖**（Claude Code 本身已内置原生 `Agent` 子代理，因此 Skill 仅面向外部编排端提供）。
 
 ## 核心特性
 
-- **强制首次 Setup 与持久化策略**（`~/.config/claude-subagent/config.json`）：首次使用前自动探测本机可用模型（原生 `claude` 及可选 `crouter` 供应商），引导向用户确认默认子代理模型与协作/使用策略并持久化保存——后续所有 Agent 统一遵守，不再出现未确认就擅自切换模型的问题。
-- **原生 Claude 开箱即用，搭配 `crouter` 体验更佳**：未安装 `crouter` 时直连原生 `claude`；检测到 `crouter` 时自动支持按供应商/场景路由，且始终附带 `--once` 不改写全局 `crouter use`。
-- **默认免打扰全权限 + 最小作用域约束**：无头 `-p` 模式默认 `bypassPermissions`，不会在执行中途卡住等待人工点批准（守住子代理省主 Agent token 的核心价值），安全边界改由 `--allowed-tools readonly|coding`、`-w <分支>` worktree 隔离与 `--timeout`/`--budget` 保障。
-- **团队规划 + 异常处理最佳实践 Skill**：`skills/claude-subagent/` 教主 Agent 何时主动拉起最小有效团队（2–4 人）、如何写无冗余的目标导向提示词、以及面对代码审查不通过、桌面抢占、超时、写冲突等异常如何闭环处理。
-- **并发安全 & 干净收尾**：文件锁原子写编号会话（`#1`、`#2`、`-r 1`、`-c`）、脏仓库本轮增量 Git 变更检测、独立进程组超时清理（`SIGINT → SIGTERM → SIGKILL`）。
+- **原生级零冗余调用体验**：直接写 `claude-subagent "做 X"`、`claude-subagent -C /repo --readonly "..."` 或 `claude-subagent -w "..."`，无需每次手填 `--title`/`--allowed-tools`/`--strict-mcp`/`--provider`，默认已含极速无头配置（`--strict-mcp-config` + `--no-chrome`，本地启动 ~0.4s）。
+- **目标文件夹（Workspace）会话绑定（全 IDE 通用）**：`#1`、`#2`、`-c`、`send`、`ps`、`stop` 严格绑定到指定的目标目录（`-C` / `--cwd` / `--workspace`，经 `realpath` 规范化），不依赖宿主 IDE 环境变量，所有客户端行为一致（`ps --all` 可跨工作区查看）。
+- **默认模型稳固 + 按次自由选模**：保留已配置的默认模型，同时支持单次 `-m <model>`（`sonnet`/`opus`/`haiku`/`fable`/`claude-*` 自动走原生 Claude，其余模型自动继承默认供应商）、`--provider <p>` 与 `claude-subagent models` 查看可用模型。
+- **原生风格动词 & 实时进度**：提供 `send <id> "消息"`、`fork <id> "消息"`、`ps`、`show <id>`、`stop <id>`、`rm <id>`、`doctor --json` 与 `--json` 结构化信封；通过 `stream-json` 实时向 `stderr` 输出轮次/工具进度并支持僵死 PID 检测。
+- **强制首次 Setup 与持久化策略**（`~/.config/claude-subagent/config.json`）：首次使用探测可用模型并确认默认路由与协作策略，后续部分更新自动增量合并。
+- **原生 Claude 开箱即用，搭配 `crouter` 体验更佳**：未安装 `crouter` 时直连原生 `claude`；检测到 `crouter` 时始终附带 `--once` 不改写全局 `crouter use`。
+- **并发安全 & 干净收尾**：`realpath` 规范化文件锁注册表、worktree 续接自动追踪、脏仓库增量 Git 检测，以及全进程组强杀清理（`SIGINT → SIGTERM → SIGKILL`）。
 
 ## 安装方式
 
@@ -72,25 +74,22 @@ claude-subagent setup \
 ### 第二步：派发、续接与独立审查
 
 ```bash
-# 预览实际路由与命令（不真实调用模型）：
-claude-subagent --cwd /path/to/repo --title "Dry run" --dry-run -p "Hello"
+# 健康检查与可用模型列表：
+claude-subagent doctor --json
+claude-subagent models
 
-# 在独立 git worktree 中派发编码子代理：
-claude-subagent \
-  --cwd /path/to/repo \
-  --title "Auth 401 error refactor" \
-  --allowed-tools coding \
-  --effort medium \
-  -w "refactor-auth" \
-  -p - <<'EOF'
-Goal: Return structured 401 JSON errors for expired tokens in src/auth/.
-Scope: src/auth/errors.py, src/auth/middleware.py, tests/test_auth_errors.py.
-Verification: pytest tests/test_auth_errors.py -q
-EOF
+# 极简派发、指定目标目录与按次切模：
+claude-subagent "修复 parser.py 边界问题并重跑 pytest -q"
+claude-subagent -C /path/to/repo --readonly "排查 src/auth/ 的 token 校验遗漏"
+claude-subagent -m sonnet "用 sonnet 精审本次并发修复"
+claude-subagent -w "重构 src/auth/ 401 错误返回并跑 pytest tests/test_auth_errors.py -q"
 
-# 查看会话并用编号续接：
-claude-subagent --cwd /path/to/repo --list
-claude-subagent --cwd /path/to/repo -r 1 -p "补齐缺失 Authorization 头的边界情况并重跑 pytest"
+# 会话查看、对话续接、分叉与中止：
+claude-subagent ps -C /path/to/repo
+claude-subagent show 1 -C /path/to/repo
+claude-subagent send 1 -C /path/to/repo "补齐缺失 Authorization 头的边界情况并重跑 pytest"
+claude-subagent fork 1 -C /path/to/repo "尝试另一种中间件实现思路"
+claude-subagent stop 1 -C /path/to/repo
 ```
 
 ## 运行测试

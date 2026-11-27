@@ -1,65 +1,56 @@
 ---
 name: claude-subagent
-description: "Plan minimal effective agent teams and delegate heavy exploration, multi-file implementation, iterative test-fix loops, independent reviews, or parallel worktree work to headless Claude Code via the `claude-subagent` CLI. Covers first-run model & usage policy setup, proactive team spin-up, outcome-oriented briefing, numbered session resumption (#1, #2), and structured exception recovery; skip trivial single-step edits."
+description: "Plan minimal effective agent teams and delegate heavy exploration, multi-file implementation, iterative test-fix loops, independent reviews, or parallel worktree work to headless Claude Code via the `claude-subagent` CLI. Use whenever 2+ independent tracks, noisy 15+ file investigations, independent reviews, or stateful numbered session resumptions (#1, #2) would keep the main context clean and cut wall-clock time; skip trivial single-step edits."
 ---
 
-# `claude-subagent`: Team Planning & Headless Claude Code Delegation
+# `claude-subagent`: Native-Grade Headless Subagent Delegation
 
-Use `claude-subagent` as a **Context Shield** and **stateful worker pool**. Offload noisy exploration, multi-file implementation, test-fix iterations, and independent reviews to isolated headless Claude Code workers so your main context stays focused on planning, integration, and verification.
+Call `claude-subagent` like a native subagent—pass your goal (and `-C <target_dir>` when targeting another folder) and let the CLI handle defaults, target-workspace session binding, flexible model selection, fast headless startup, and live progress.
 
-Works out of the box with **native Claude Code** directly, and pairs even better with [`crouter`](https://github.com/Luckycat133/crouter) for multi-provider or local model routing.
+Works out of the box with **native Claude Code**, and pairs seamlessly with [`crouter`](https://github.com/Luckycat133/crouter) for multi-provider or local model routing. (Designed for external host agents like Codex, Antigravity, Cursor, and Gemini CLI—Claude Code already has native `Agent` subagents.)
 
-## 1. Mandatory First-Run Setup & Persistent Policy
+## 1. Zero-Ceremony Usage & Target-Workspace Binding
 
-Before delegating for the first time, check persisted configuration:
+You do **not** need to pass `--title`, `--allowed-tools`, `--strict-mcp`, `--effort`, or `--provider` on routine calls:
+- **Target-workspace binding**: sessions (`#1`, `#2`, `send`, `fork`, `ps`, `stop`, `-c`) bind strictly to the target workspace (`-C` / `--cwd` / `--workspace`, defaulting to current directory, canonicalized via `realpath`). Use `ps --all` to inspect sessions across all workspaces.
+- **Default route & free model selection**: defaults to your persisted config (`~/.config/claude-subagent/config.json`, e.g., `openrouter` / `nvidia/nemotron-3.5-super-vl:free`). Unconfigured runs exit with code `2` (`SETUP_REQUIRED`). Override per call anytime with `-m <model>` (native aliases `sonnet`/`opus`/`haiku`/`fable`/`claude-*` auto-route to native `claude`, while other model IDs inherit your saved provider) or `--provider <p>`, and list options with `claude-subagent models`.
+- **Fast headless defaults**: `--strict-mcp-config`, `--no-chrome`, and `bypassPermissions` apply automatically (~0.4s local startup). Pass `--with-mcp`, `--mcp-config <file>`, or `--chrome` when a task needs them.
 
 ```bash
-claude-subagent config show
+claude-subagent "Audit src/auth/ and summarize token validation gaps."
+claude-subagent -C /path/to/repo --readonly "Find all places touching session cleanup."
+claude-subagent -m sonnet "Review this tricky concurrency change carefully."
+claude-subagent -w "Refactor auth 401 errors and run pytest tests/test_auth.py -q."
+claude-subagent send 1 "Also cover missing Authorization header and re-run pytest."
+claude-subagent fork 1 "Try an alternative middleware design without touching #1."
+claude-subagent ps
+claude-subagent stop 1
 ```
 
-If unconfigured (exit code `2` / `SETUP_REQUIRED`):
-1. Run `claude-subagent setup --discover` to inspect available models (`claude` native and, if installed, all configured `crouter` providers and default models).
-2. **Always ask the user before running any subagent**—even when `crouter` is already installed. Confirm and explicitly inform the user their choices will be saved as the persistent default:
-   - **Default subagent model/provider** (used automatically on all future runs unless the user or orchestrator explicitly overrides it).
-   - **Delegation & usage policy**: whether to spin up subagents proactively (`proactive` / `ask-first` / `explicit-only`), and any personal usage boundaries or reminders to save in `usagePolicy` (e.g., when to remind the user before delegating, or optional per-agent overrides).
-3. Persist via `claude-subagent setup ...` (see [Recipes & Flags](references/recipes-and-flags.md)).
+## 2. First-Run Setup & Persistent Policy
 
-On every subsequent run, respect the persisted `config.json`—never silently switch away from the user's confirmed default model, and honor any reminders or boundaries recorded in `policies.usagePolicy`.
+If `claude-subagent` exits with code `2` (`SETUP_REQUIRED`), or if `claude-subagent` is not yet on `PATH` (install via `uv tool install git+https://github.com/Luckycat133/claude-subagent.git` or `pip install ...`):
+1. Run `claude-subagent setup --discover` to inspect available models (`claude` native and any configured `crouter` providers).
+2. Ask the user to confirm before running any subagent—noting their choice is saved persistently:
+   - **Default subagent model/provider**
+   - **Delegation & usage policy** (`proactive` / `ask-first` / `explicit-only`, plus any reminders for `usagePolicy`)
+3. Persist via `claude-subagent setup ...` (see [Recipes & Flags](references/recipes-and-flags.md)). Subsequent partial `setup` calls merge onto the existing config.
 
-## 2. When to Proactively Spin Up a Team
+Always honor `policies.usagePolicy` (inspect anytime with `claude-subagent doctor --json`).
 
-When `delegationMode` is `proactive`, **initiate delegation on your own without waiting to be asked** whenever any of these hold:
+## 3. When to Spin Up a Team vs. Work Directly
 
-- **2+ independent tracks** with disjoint write scopes (parallelism cuts wall-clock time).
-- **Heavy context load**: reading 15+ files, digging through verbose build/test logs, or multi-file refactors that would bloat the orchestrator's context window.
-- **Consequential changes needing fresh eyes**: dispatch an independent read-only reviewer after implementation to break confirmation bias.
-- **Specialized local agents**: offload dedicated workflows (e.g. `--agent video-watcher` for multi-frame media inspection).
+When `delegationMode` is `proactive`, delegate on your own whenever any of these hold:
+- **2+ independent tracks** with disjoint write scopes (launch concurrently in the same turn).
+- **Heavy context load**: reading 15+ files, verbose build/test logs, or multi-file refactors.
+- **Independent verification**: dispatch `--role review` (or `--readonly`) after implementation so fresh eyes check the diff without confirmation bias.
+- **Specialized local agents**: offload dedicated workflows (`--agent video-watcher`, `test-runner`, `link-auditor`, `repo-hygiene-cleaner`, etc.).
 
-**Execute directly instead** for single-file edits, quick lookups, strictly sequential 1-step changes, or tight interactive back-and-forth with the user.
+Execute directly instead for single-file edits, quick lookups, or strictly sequential 1-step changes.
 
-## 3. Plan the Team & Write Outcome-Oriented Briefs
+## 4. Briefing, Parallelism & Verification
 
-See [Team Topologies](references/team-topologies.md) for topologies and handoff templates.
-
-1. **Preflight**: Check `git status --short`, `git worktree list`, and `git remote -v` (in multi-repo workspaces, do not edit third-party clones unless explicitly requested).
-2. **Partition by Write Boundaries & Dependencies**:
-   - Keep teams small (usually **2–4 workers**) and match concurrency to your backend's capacity.
-   - Enforce **single-writer ownership** per file, artifact, port, or service. When parallel writers touch the same git repo, isolate each in a worktree (`-w <name>`) so git diffs stay separated.
-   - Stage dependent phases cleanly (e.g. scout → parallel implementers → independent reviewer → coordinator merge).
-3. **Brief for Outcomes, Not Micromanagement**:
-   - State the **goal, acceptance criteria, write scope (owned vs. off-limits paths), and verification command**.
-   - **Do not micromanage** step-by-step instructions or dump redundant prose the worker can read from the repo itself. Only add non-obvious constraints, repro details, or required invariants.
-   - Always pass `--cwd <abs_path>`, a distinct `--title "<short task>"`, and `-p - <<'EOF' ... EOF` for multi-line briefs.
-4. **Permissions & Least-Privilege Scoping**:
-   - Headless `claude -p` defaults to `bypassPermissions` so workers execute unattended without stalling on interactive prompts or burning parent tokens.
-   - Timeout and output length are **unlimited by default**—only pass `--timeout` or `--max-output-chars` if explicitly desired.
-   - Enforce safety through **scope, not prompts**: `--allowed-tools readonly --strict-mcp` for scouts/reviewers, `--allowed-tools coding` for writers, `-w <name>` for git isolation, and optional `--budget`.
-
-## 4. Handle Exceptions & Verify Before Delivery
-
-See [Exception Handling Playbook](references/exception-handling.md) for full recovery patterns.
-
-- **Review / test failures**: Do not stop at a failing review—resume the owning session (`-r <id>`) with concrete findings and iterate until checks pass. Break out only on external blockers, genuine design ambiguity, or repeated identical failures requiring a new strategy.
-- **User / host contention** (e.g. GUI / Computer Use or shared active workspace): If the user is actively operating the desktop or target app, **yield and pause immediately** rather than fighting for focus.
-- **Interrupted runs**: New sessions pre-assign a `--session-id` so interrupted runs still record `#N`, recover last activity from the transcript, and print a ready-to-run `-r <id>` resume command.
-- **Always verify independently**: Inspect actual `git status --short`, `git diff --stat`, worktree merge state (worktree edits are not on the main branch until merged), and test exit codes before declaring completion.
+- **Brief for outcomes, not micromanagement**: state the goal, acceptance criteria, write boundaries, and verification command—do not dump repo contents the worker can read itself. Use `-p - <<'EOF' ... EOF` (or piped `stdin`) for multi-line briefs. See [Team Topologies](references/team-topologies.md).
+- **Isolate parallel writers**: give each concurrent writer disjoint paths or `-w "<task>"` / `-w <branch> "<task>"`.
+- **Live progress & unlimited runtime**: timeout and output length are unlimited by default—avoid artificial short `--timeout` caps; `stderr` streams live turn/tool progress (`-q` silences) and `claude-subagent show <id>` / `ps` inspects live or interrupted state. See [Exception Handling](references/exception-handling.md).
+- **Verify independently**: inspect actual `git status --short`, `git diff --stat`, worktree merge state (worktree edits stay on the worktree branch until merged), and test exit codes before declaring completion.

@@ -2,6 +2,35 @@
 
 All notable changes to `claude-subagent` are documented in this file.
 
+## [0.3.0] - 2026-11-27
+
+### Added
+- **Native-grade minimal CLI syntax**: positional prompt (`claude-subagent "do X"`), automatic `stdin` reading when piped, smart `-w "<prompt>"` promotion, `-R`/`--readonly`, `--role research|review|implement`, and `-C`/`--workspace` aliases for `--cwd`.
+- **Flexible model selection with preserved default**: added `-m` shorthand alongside `--model`, auto-routing native Claude aliases/models (`sonnet`, `opus`, `haiku`, `fable`, `claude-*`) when `--provider` is omitted while inheriting the persisted provider for all other model IDs, plus `claude-subagent models [--json]` to inspect all configured routes.
+- **Native-style session verbs**: `send <id> "msg"` (aliases `reply`, `followup`, `resume`), `fork <id> "msg"`, `ps` (alias `list`, with `--all` across workspaces), `show <id>`, `stop <id>` (terminates running process group while preserving session), `rm <id>` (alias `close`), and `clear`.
+
+### Changed
+- Sessions remain cleanly bound to the target workspace (`-C` / `--cwd` / `--workspace`) via `realpath`, keeping behavior uniform across all host IDEs without host-specific adapters.
+- Removed `.claude/skills/claude-subagent` and `${HOME}/.claude/skills` from `install.sh` (Claude Code already provides native `Agent` subagents), and updated `install.sh` to copy `skills/claude-subagent` as a real directory instead of symlinking.
+
+## [0.2.0] - 2026-11-25
+
+### Added
+- Live NDJSON streaming execution (`--output-format stream-json --verbose`) with real-time `stderr` turn/tool progress updates (`-q`/`--quiet` to suppress) and crash-safe live telemetry capture.
+- Crash-proof `running` session lifecycle pre-registration (`register_running_session`, `update_session_pid`, `finalize_session`) with automatic stale-PID detection (`interrupted (stale pid)`) in `sessions list` / `sessions show`.
+- Composable CLI subcommands: `claude-subagent doctor [--json] [--cwd <dir>]`, `claude-subagent sessions [list|show <id>|delete <id>|clear] [--cwd <dir>] [--json]`, `claude-subagent list`, and `claude-subagent run`.
+- Structured machine-readable `--json` delivery envelope (`ok`, `status`, `exitCode`, `session`, `route`, `metrics`, `git`, `report`, `lastActivity`, `error`).
+- Fast headless defaults (`--strict-mcp-config` and `--no-chrome` enabled by default), with opt-in overrides `--with-mcp`, `--mcp-config <file|json>`, `--chrome`, and persistent `setup --strict-mcp-default` / `--with-mcp-default`.
+- New Claude Code 2.1.x pass-through flags: `--fork` / `--fork-session` (creates a new numbered session branch), `--fallback-model`, `--json-schema` (inline or file), `--ephemeral` / `--no-session-persistence`, and `-- <extra claude args...>` raw escape hatch.
+
+### Fixed
+- Registry path canonicalization now uses `os.path.realpath(cwd)` with legacy `abspath` fallback, unifying symlinked workspaces (e.g. `/tmp` vs `/private/tmp` on macOS).
+- Passing `--model` without `--provider` now inherits persisted `defaultRoute.backend` and `defaultRoute.provider` instead of falling back to `crouter run`.
+- Resuming a worktree session (`-r <id>` without `-w`) now preserves `worktree_path` and inspects git changes inside the worktree rather than the main checkout.
+- Partial `claude-subagent setup` updates now merge onto existing configuration instead of clobbering untouched fields (pass `--replace` to overwrite).
+- Process-group teardown (`_terminate_process_group`) now checks descendant pipe/process-group liveness across `SIGINT -> SIGTERM -> SIGKILL` so backgrounded child processes cannot survive timeouts.
+- Skipped redundant git subprocess calls on non-git directories and dirty-delta snapshots.
+
 ## [0.1.4] - 2026-11-24
 
 ### Changed
